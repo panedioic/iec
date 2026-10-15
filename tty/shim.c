@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pty.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,6 +165,15 @@ static struct shim_tty *state_get(int pts_n) {
     s->tio.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
     s->tio.c_cc[VMIN] = 1;
     s->tio.c_cc[VTIME] = 0;
+    /* The control characters matter as much as the flags here: the struct was
+     * memset, so without these VERASE would be NUL and backspace would be
+     * treated as an erase request for every NUL byte typed. */
+    s->tio.c_cc[VINTR] = 0x03;    /* ^C  */
+    s->tio.c_cc[VQUIT] = 0x1c;    /* ^\  */
+    s->tio.c_cc[VERASE] = 0x7f;   /* DEL */
+    s->tio.c_cc[VKILL] = 0x15;    /* ^U  */
+    s->tio.c_cc[VEOF] = 0x04;     /* ^D  */
+    s->tio.c_cc[VSUSP] = 0x1a;    /* ^Z  */
     s->ws.ws_row = 24;
     s->ws.ws_col = 80;
     return s;
@@ -339,44 +349,165 @@ int IEC_EXPORT(close)(int fd) {
     return real_close(fd);
 }
 
-/* The output half of the line discipline.
+/* The line discipline.
  *
- * A real pty applies OPOST|ONLCR to everything the program writes, turning each
- * "\n" into "\r\n". Our fds are a plain socketpair, so those bytes arrive at the
- * master untouched and the terminal emulator gets a bare linefeed: it moves down
- * without returning to column 0, which is the classic staircase. Reproduce the
- * conversion here, on the master's read path -- that is the one place both
- * injection modes can reach it, since the shell in warp mode is not wrapped.
+ * A real pty runs two filters around the fd pair. Output: OPOST|ONLCR turns each
+ * "\n" a program writes into "\r\n" on its way to the terminal. Input: control
+ * characters become signals, CR folds to NL, canonical mode assembles whole
+ * lines, and what was typed is echoed back.
  *
- * The raw bytes are read into the second half of the caller's buffer and the
- * expanded result is built in the first half, so the two never overlap. Reading
- * at most half the buffer guarantees every newline has room to double, which is
- * what lets this work without a pending buffer -- holding leftover bytes here
- * would make poll()/epoll() stop reporting the fd as readable while data was
- * still owed to the caller. */
+ * Neither happens over a plain socketpair, so both are reproduced here. The
+ * output half runs on the master's read path, the one place both injection modes
+ * reach it (the shell in warp mode is not wrapped). The input half has to run on
+ * the slave's read path instead: only the process doing the read holds the live
+ * termios -- readline edits its own copy -- and knows which process group should
+ * get the signals.
+ */
+
+#define LINE_MAX 4096
+
+/* Canonical-mode input being assembled, one buffer per pts. */
+static unsigned char g_line[SHIM_MAX_PTS][LINE_MAX];
+static size_t g_line_len[SHIM_MAX_PTS];
+static int g_line_ready[SHIM_MAX_PTS];
+
+static int state_index(const struct shim_tty *t) {
+    return (int)(t - g_pts);
+}
+
+static void line_put(int idx, unsigned char c) {
+    if (g_line_len[idx] < LINE_MAX) {
+        g_line[idx][g_line_len[idx]++] = c;
+    } else {
+        /* Line limit reached: release what we have so the reader can drain it
+         * instead of deadlocking on a line that can never complete. */
+        g_line_ready[idx] = 1;
+    }
+}
+
+/* Writes a typed character back out through the slave fd, i.e. to the master, so
+ * the emulator draws it. Best effort: there is nothing useful to do if the
+ * terminal has gone away. */
+static void input_echo(struct shim_tty *t, int fd, unsigned char c) {
+    if ((t->tio.c_lflag & ECHOCTL) && c < 0x20 && c != '\t' && c != '\n') {
+        unsigned char out[2];
+        out[0] = '^';
+        out[1] = (unsigned char)(c + '@');
+        if (write(fd, out, 2) != 2) return;
+        return;
+    }
+    if (write(fd, &c, 1) != 1) return;
+}
+
+static void input_erase_echo(int fd) {
+    if (write(fd, "\b \b", 3) != 3) return;
+}
+
+static void input_filter(struct shim_tty *t, int fd, const unsigned char *in, size_t len) {
+    int idx = state_index(t);
+    int canon = (t->tio.c_lflag & ICANON) != 0;
+    int echo = (t->tio.c_lflag & ECHO) != 0;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        unsigned char c = in[i];
+
+        if ((t->tio.c_iflag & ICRNL) && c == '\r') c = '\n';
+
+        if ((t->tio.c_lflag & ISIG) &&
+            (c == t->tio.c_cc[VINTR] || c == t->tio.c_cc[VQUIT] ||
+             c == t->tio.c_cc[VSUSP])) {
+            int sig = c == t->tio.c_cc[VINTR] ? SIGINT
+                    : c == t->tio.c_cc[VQUIT] ? SIGQUIT
+                                              : SIGTSTP;
+            if (echo) input_echo(t, fd, c);
+            /* Signal the foreground group, but only inside our own session. A
+             * stale or bogus group number must never reach unrelated processes:
+             * the terminal, the shell that started it, or this agent's own
+             * shell are all one bad kill(-n) away. */
+            if (t->fg_pgrp > 0 && getsid(t->fg_pgrp) == getsid(0))
+                kill(-t->fg_pgrp, sig);
+            g_line_len[idx] = 0;   /* the partly typed line is discarded */
+            continue;
+        }
+
+        if (canon && t->tio.c_cc[VERASE] != _POSIX_VDISABLE &&
+            c == t->tio.c_cc[VERASE]) {
+            if (g_line_len[idx] > 0) {
+                g_line_len[idx]--;
+                if (echo && (t->tio.c_lflag & ECHOE)) input_erase_echo(fd);
+            }
+            continue;
+        }
+
+        line_put(idx, c);
+        if (echo || (canon && (t->tio.c_lflag & ECHONL) && c == '\n'))
+            input_echo(t, fd, c);
+
+        if (!canon || c == '\n') g_line_ready[idx] = 1;
+    }
+}
+
 ssize_t IEC_EXPORT(read)(int fd, void *buf, size_t n) {
     struct shim_tty *t = tty_of(fd);
     unsigned char *b = buf;
-    size_t room, i, o;
+    size_t room, i, o, produced;
     ssize_t r;
 
     RESOLVE(real_read, read);
 
+    if (!t) return real_read(fd, buf, n);
+
     /* is_master is per fd, not per pts: the state block is shared by both ends,
      * and only the fd opened through /dev/ptmx carries the master's output. */
-    if (!t || !g_fd[fd].is_master || n < 2 ||
-        !(t->tio.c_oflag & OPOST) || !(t->tio.c_oflag & ONLCR))
-        return real_read(fd, buf, n);
+    if (g_fd[fd].is_master) {
+        /* Output half. The raw bytes go into the second half of the caller's
+         * buffer and the expanded result into the first, so the two never
+         * overlap; reading at most half the buffer guarantees every newline has
+         * room to double. That is what lets this work without a pending buffer
+         * -- holding bytes back would make poll()/epoll() stop reporting the fd
+         * as readable while data was still owed to the caller. */
+        if (n < 2 || !(t->tio.c_oflag & OPOST) || !(t->tio.c_oflag & ONLCR))
+            return real_read(fd, buf, n);
 
-    room = n / 2;
-    r = real_read(fd, b + room, room);
-    if (r <= 0) return r;
+        room = n / 2;
+        r = real_read(fd, b + room, room);
+        if (r <= 0) return r;
 
-    for (i = 0, o = 0; i < (size_t)r; i++) {
-        if (b[room + i] == '\n') b[o++] = '\r';
-        b[o++] = b[room + i];
+        for (i = 0, o = 0; i < (size_t)r; i++) {
+            if (b[room + i] == '\n') b[o++] = '\r';
+            b[o++] = b[room + i];
+        }
+        return (ssize_t)o;
     }
-    return (ssize_t)o;
+
+    /* Input half. Blocking here while a line is still incomplete is correct: a
+     * canonical read() is supposed to wait for one. */
+    for (;;) {
+        int idx = state_index(t);
+
+        if (g_line_ready[idx]) {
+            produced = 0;
+            while (g_line_ready[idx] && produced < n) {
+                size_t take = g_line_len[idx];
+                if (take > n - produced) take = n - produced;
+                memcpy(b + produced, g_line[idx], take);
+                memmove(g_line[idx], g_line[idx] + take, g_line_len[idx] - take);
+                g_line_len[idx] -= take;
+                produced += take;
+                if (g_line_len[idx] == 0) g_line_ready[idx] = 0;
+            }
+            return (ssize_t)produced;
+        }
+
+        {
+            unsigned char tmp[512];
+            r = real_read(fd, tmp, sizeof tmp);
+            if (r < 0) return -1;
+            if (r == 0) return 0;
+            input_filter(t, fd, tmp, (size_t)r);
+        }
+    }
 }
 
 /* Duplicating a tty fd has to carry the table entry over, otherwise the copy is
@@ -655,6 +786,10 @@ int IEC_EXPORT(login_tty)(int fd) {
             char v[16];
             snprintf(v, sizeof v, "%d", t->pts_n);
             setenv(IEC_TTY_ENV, v, 1);
+            /* setsid() above gave this process its own group; the state block was
+             * built in the parent and still names the parent's group, and acting
+             * on that would signal the wrong processes. */
+            t->fg_pgrp = getpgrp();
         }
     }
 
