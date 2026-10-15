@@ -33,9 +33,9 @@ SOCK_HDR := common/sock_client.h
 # Every pty entry point the shim takes over. MODE=warp needs a --wrap for each,
 # so that calls from the client are redirected to __wrap_<name>; MODE=preload
 # interposes them by symbol name instead and needs none of these.
-SHIM_WRAPS := open close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r \
-              tcgetattr tcsetattr tcgetpgrp tcsetpgrp getpt grantpt unlockpt \
-              ptsname openpty login_tty forkpty
+SHIM_WRAPS := open close read dup dup2 dup3 fcntl ioctl isatty ttyname \
+              ttyname_r tcgetattr tcsetattr tcgetpgrp tcsetpgrp getpt grantpt \
+              unlockpt ptsname openpty login_tty forkpty
 WRAP_FLAGS := $(foreach s,$(SHIM_WRAPS),-Wl,--wrap=$(s))
 
 SERVER_BIN  := $(DIST)/tty_server

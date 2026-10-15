@@ -40,6 +40,7 @@
  * __real_<name>, but the compiler still needs a declaration to reference it. */
 extern int __real_open(const char *, int, ...);
 extern int __real_close(int);
+extern ssize_t __real_read(int, void *, size_t);
 extern int __real_dup(int);
 extern int __real_dup2(int, int);
 extern int __real_dup3(int, int, int);
@@ -66,6 +67,7 @@ extern int __real_ttyname_r(int, char *, size_t);
 
 static int (*real_open)(const char *, int, ...);
 static int (*real_close)(int);
+static ssize_t (*real_read)(int, void *, size_t);
 static int (*real_dup)(int);
 static int (*real_dup2)(int, int);
 static int (*real_dup3)(int, int, int);
@@ -96,7 +98,6 @@ static int (*real_ttyname_r)(int, char *, size_t);
 struct shim_tty {
     int used;
     int pts_n;              /* the "/dev/pts/<n>" number */
-    int is_master;          /* informational: first reached through /dev/ptmx */
     pid_t fg_pgrp;          /* emulated foreground process group (job control) */
     struct termios tio;
     struct winsize ws;
@@ -336,6 +337,46 @@ int IEC_EXPORT(close)(int fd) {
     tty_clear(fd);
     RESOLVE(real_close, close);
     return real_close(fd);
+}
+
+/* The output half of the line discipline.
+ *
+ * A real pty applies OPOST|ONLCR to everything the program writes, turning each
+ * "\n" into "\r\n". Our fds are a plain socketpair, so those bytes arrive at the
+ * master untouched and the terminal emulator gets a bare linefeed: it moves down
+ * without returning to column 0, which is the classic staircase. Reproduce the
+ * conversion here, on the master's read path -- that is the one place both
+ * injection modes can reach it, since the shell in warp mode is not wrapped.
+ *
+ * The raw bytes are read into the second half of the caller's buffer and the
+ * expanded result is built in the first half, so the two never overlap. Reading
+ * at most half the buffer guarantees every newline has room to double, which is
+ * what lets this work without a pending buffer -- holding leftover bytes here
+ * would make poll()/epoll() stop reporting the fd as readable while data was
+ * still owed to the caller. */
+ssize_t IEC_EXPORT(read)(int fd, void *buf, size_t n) {
+    struct shim_tty *t = tty_of(fd);
+    unsigned char *b = buf;
+    size_t room, i, o;
+    ssize_t r;
+
+    RESOLVE(real_read, read);
+
+    /* is_master is per fd, not per pts: the state block is shared by both ends,
+     * and only the fd opened through /dev/ptmx carries the master's output. */
+    if (!t || !g_fd[fd].is_master || n < 2 ||
+        !(t->tio.c_oflag & OPOST) || !(t->tio.c_oflag & ONLCR))
+        return real_read(fd, buf, n);
+
+    room = n / 2;
+    r = real_read(fd, b + room, room);
+    if (r <= 0) return r;
+
+    for (i = 0, o = 0; i < (size_t)r; i++) {
+        if (b[room + i] == '\n') b[o++] = '\r';
+        b[o++] = b[room + i];
+    }
+    return (ssize_t)o;
 }
 
 /* Duplicating a tty fd has to carry the table entry over, otherwise the copy is
