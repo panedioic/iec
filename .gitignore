@@ -1,0 +1,42 @@
+# ---- Build outputs ----
+# Intermediate objects, plus the generated protocols/ and config.h written by
+# scripts/build_client.sh
+/build/
+# Final artifacts: shim_tty.so, weston-terminal-wrap, tty_server
+/dist/
+
+# ---- Prebuilt client binary ----
+# Host-built weston-terminal, the target that gets intercepted. Reproduce with:
+#   scripts/build_client.sh -o weston-terminal
+# Delete this line if you would rather commit the binary.
+/weston-terminal
+
+# ---- Compiled objects and libraries ----
+*.o
+*.a
+*.so
+*.so.*
+
+# ---- Runtime leftovers ----
+# A UDS socket created inside the tree (the default path is /tmp/tty_service.sock)
+*.sock
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+tags
+compile_commands.json
+.cache/
+.clangd/
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
+
+# ---- Core dumps ----
+core
+core.*
+vgcore.*
