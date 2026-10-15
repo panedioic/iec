@@ -1,19 +1,51 @@
 // tty/tty_server.cpp — TtyServer implementation
 //
-// Faking a pty: the sandboxed client cannot open /dev/ptmx, so we hand it a
-// socketpair instead. The two ends behave like a pty pair (a byte stream that is
-// readable and writable from both sides), which is all the client needs:
+// Faking a pty, with the server standing in the middle of the data path.
 //
-//   socketpair(sv)  ->  sv[0] = master, goes to the client right away
-//                       sv[1] = slave,  kept here until the client opens
-//                                       /dev/pts/<n>, then handed over
+// The sandboxed client cannot open /dev/ptmx, so the pair it gets is built out
+// of two socketpairs instead of one:
 //
-// The slave end is only held so that open("/dev/pts/<n>") has something to give
-// back; once it is handed over we drop our copy, so that closing either end in
-// the client is visible to the other one (EOF/HUP), which a terminal needs.
+//   pair A:  A[0] -> the client, in the role of the master
+//            A[1] -> us
+//   pair B:  B[0] -> us
+//            B[1] -> the client, in the role of the slave, handed over the
+//                    first time it opens /dev/pts/<n>
+//
+// Keeping an end of each pair is the whole point: every byte crosses this
+// process, so the line discipline the kernel would otherwise run between the two
+// ends lives here, next to the termios, the window size and the foreground
+// process group it needs.
+//
+//   read(A[1]) -> input filter  -> B[0]    ICRNL, ISIG, canonical lines, ECHO
+//   read(B[0]) -> output filter -> A[1]    OPOST|ONLCR
+//
+// That is what driving the filters from the client's read() hooks could not do:
+// input was only processed once somebody read the terminal, so ^C could not
+// interrupt a program that was not reading its stdin, and nothing was echoed
+// while nobody read. Here the input is processed when it arrives, and the
+// signals come from the process that knows the foreground group.
+//
+// Nothing on this side ever blocks. One thread serves every pty, so a blocking
+// write to a full socket would stall the loop and freeze every terminal at once;
+// bytes that do not fit wait in a per-pty queue while the fd is watched for
+// POLLOUT. The queues double as flow control: once one grows past kQueueMax its
+// source fd leaves the poll set and the peer's write blocks, which is what a real
+// pty does with a full buffer.
+//
+// EOF travels the same road as the data:
+//   read(A[1]) == 0  -> close B[0], so the program sees EOF on its stdin
+//   read(B[0]) == 0  -> close A[1], so the terminal sees EOF on the master
+// and a terminal that goes away hangs its program up on the way out, the way a
+// real pty does.
 #include "tty_server.h"
 
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -24,11 +56,27 @@
 namespace {
 
 constexpr int kMaxPtys = 64;
+// One canonical line, as much as the client-side emulation used to hold.
+constexpr size_t kLineMax = 4096;
+// Ceiling on either per-pty queue. Reaching it stops the source from being read
+// at all, so this is a bound on how far the program may run ahead of the
+// terminal, not just a buffer limit.
+constexpr size_t kQueueMax = 64 * 1024;
 
 struct Pty {
     bool used = false;
-    int pts_n = 0;        // the "/dev/pts/<n>" number handed to the client
-    int slave_fd = -1;    // our copy of the slave end, until OPENPTS takes it over
+    int pts_n = 0;
+    int term_fd = -1;    // A[1], our end of the terminal side
+    int app_fd = -1;     // B[0], our end of the program side
+    int slave_fd = -1;   // B[1], ours only until OPENPTS hands it to the client
+    bool term_eof = false;
+    bool app_eof = false;
+    pid_t fg_pgrp = 0;   // foreground process group of this pty, for signals
+    termios tio {};
+    winsize ws {};
+    std::vector<uint8_t> line;     // canonical input not yet released
+    std::vector<uint8_t> to_app;   // filtered input waiting for room on app_fd
+    std::vector<uint8_t> to_term;  // echo and program output waiting on term_fd
 };
 
 Pty g_pty[kMaxPtys];
@@ -46,15 +94,262 @@ Pty* findByPts(int pts_n) {
     return nullptr;
 }
 
+enum class Role { None, Term, App };
+
+// Maps a polled fd back to the pty that owns it. Closed ends carry -1, so a
+// stale fd number can only ever be mistaken for a live one of the same pty.
+Pty* ptyOwnedBy(int fd, Role& role) {
+    for (int i = 0; i < kMaxPtys; i++) {
+        Pty& e = g_pty[i];
+        if (!e.used) continue;
+        if (e.term_fd == fd) { role = Role::Term; return &e; }
+        if (e.app_fd == fd)  { role = Role::App;  return &e; }
+    }
+    role = Role::None;
+    return nullptr;
+}
+
+void closeFd(int& fd) {
+    if (fd >= 0) close(fd);
+    fd = -1;
+}
+
+// openpty() opens its slave blocking, and the client's end must stay that way:
+// O_NONBLOCK lives on the open file description, and the two ends of a
+// socketpair are separate descriptions, so this only affects our side.
+void setNonBlock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+// What a fresh pty looks like, i.e. a plain cooked terminal.
+void initTermios(Pty& e) {
+    memset(&e.tio, 0, sizeof e.tio);
+    e.tio.c_iflag = ICRNL | IXON;
+    e.tio.c_oflag = OPOST | ONLCR;
+    // The speed bits are not used by anything here, but a tty that reports
+    // 0 baud is not what a program opening a pty expects to find.
+    e.tio.c_cflag = CS8 | CREAD | CLOCAL | B38400;
+    e.tio.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
+    e.tio.c_ispeed = B38400;
+    e.tio.c_ospeed = B38400;
+    e.tio.c_cc[VMIN] = 1;
+    e.tio.c_cc[VTIME] = 0;
+    // The control characters matter as much as the flags: a zeroed struct would
+    // leave VERASE at NUL and make every NUL byte an erase request.
+    e.tio.c_cc[VINTR] = 0x03;    // ^C
+    e.tio.c_cc[VQUIT] = 0x1c;    // ^\ -> SIGQUIT
+    e.tio.c_cc[VERASE] = 0x7f;   // DEL
+    e.tio.c_cc[VKILL] = 0x15;    // ^U
+    e.tio.c_cc[VEOF] = 0x04;     // ^D
+    e.tio.c_cc[VSUSP] = 0x1a;    // ^Z
+    e.ws.ws_row = 24;
+    e.ws.ws_col = 80;
+}
+
+// Pushes as much of q as the socket will take. False means the peer is gone,
+// which is worth exactly as much as reading EOF from it.
+bool drainQueue(int fd, std::vector<uint8_t>& q) {
+    while (!q.empty()) {
+        // MSG_NOSIGNAL, or a program that exits with input still in flight
+        // would take the whole server down with SIGPIPE.
+        ssize_t w = send(fd, q.data(), q.size(), MSG_NOSIGNAL);
+        if (w > 0) {
+            q.erase(q.begin(), q.begin() + w);
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;  // POLLOUT will say when
+        return false;
+    }
+    return true;
+}
+
+// Signals only ever go to a group we can vouch for. The number is whatever the
+// client last passed to tcsetpgrp, and the terminal, the shell that started it
+// and this agent's own shell are all one bad kill(-n) away, so it has to look
+// like a foreground process group before it is used.
+//
+// Same session as the server is one shape that proves it. Being the leader of a
+// session of its own is the other, and it is the one that matters in practice:
+// login_tty() calls setsid() before the program execs, so a shell's foreground
+// group is its own session and never the server's.
+bool trustedFgPgrp(pid_t pgrp) {
+    pid_t sid;
+    if (pgrp <= 0) return false;
+    if (pgrp == getpgrp() || pgrp == getpid()) return false;  // never signal ourselves
+    sid = getsid(pgrp);
+    if (sid < 0) return false;                                // no such group any more
+    return sid == getsid(0) || sid == pgrp;
+}
+
+void signalFg(Pty& e, int sig) {
+    if (trustedFgPgrp(e.fg_pgrp)) kill(-e.fg_pgrp, sig);
+}
+
+// ------------------------------------------------------------------
+// Output side: what the program wrote, on its way to the terminal
+// ------------------------------------------------------------------
+
+void filterOutput(Pty& e, const uint8_t* in, size_t len) {
+    const bool onlcr = (e.tio.c_oflag & OPOST) && (e.tio.c_oflag & ONLCR);
+
+    if (!onlcr) {
+        e.to_term.insert(e.to_term.end(), in, in + len);
+        return;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (in[i] == '\n') e.to_term.push_back('\r');
+        e.to_term.push_back(in[i]);
+    }
+}
+
+// ------------------------------------------------------------------
+// Input side: what the terminal typed, on its way to the program
+// ------------------------------------------------------------------
+
+// Echo goes through the output filter, not straight to the terminal: the kernel
+// puts echoed characters on the same output queue as the program's, which is
+// what turns the echo of a return into CRLF.
+void echoByte(Pty& e, unsigned char c) {
+    uint8_t out[2];
+    size_t n = 1;
+
+    if ((e.tio.c_lflag & ECHOCTL) && c < 0x20 && c != '\t' && c != '\n') {
+        out[0] = '^';
+        out[1] = static_cast<uint8_t>(c + '@');
+        n = 2;
+    } else {
+        out[0] = c;
+    }
+    filterOutput(e, out, n);
+}
+
+void echoErase(Pty& e) {
+    static const uint8_t backspace_space_backspace[3] = {'\b', ' ', '\b'};
+    filterOutput(e, backspace_space_backspace, sizeof backspace_space_backspace);
+}
+
+// Hands the assembled line to the program. Canonical mode means the program
+// only ever sees complete lines, which is why it can block in read() until the
+// user presses return and why the queue behind it needs no line boundaries.
+void releaseLine(Pty& e) {
+    e.to_app.insert(e.to_app.end(), e.line.begin(), e.line.end());
+    e.line.clear();
+}
+
+void filterInput(Pty& e, const uint8_t* in, size_t len) {
+    const bool canon = (e.tio.c_lflag & ICANON) != 0;
+    const bool echo = (e.tio.c_lflag & ECHO) != 0;
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = in[i];
+
+        if ((e.tio.c_iflag & ICRNL) && c == '\r') c = '\n';
+
+        if ((e.tio.c_lflag & ISIG) &&
+            (c == e.tio.c_cc[VINTR] || c == e.tio.c_cc[VQUIT] ||
+             c == e.tio.c_cc[VSUSP])) {
+            int sig = c == e.tio.c_cc[VINTR] ? SIGINT
+                    : c == e.tio.c_cc[VQUIT] ? SIGQUIT
+                                             : SIGTSTP;
+            if (echo) echoByte(e, c);
+            signalFg(e, sig);
+            e.line.clear();  // the partly typed line goes with the signal
+            continue;
+        }
+
+        if (canon && e.tio.c_cc[VERASE] != _POSIX_VDISABLE &&
+            c == e.tio.c_cc[VERASE]) {
+            if (!e.line.empty()) {
+                e.line.pop_back();
+                if (echo && (e.tio.c_lflag & ECHOE)) echoErase(e);
+            }
+            continue;
+        }
+
+        e.line.push_back(c);
+        if (echo || (canon && (e.tio.c_lflag & ECHONL) && c == '\n'))
+            echoByte(e, c);
+
+        if (!canon || c == '\n') releaseLine(e);
+
+        // A line that never ends must still make room for the rest of the
+        // terminal: release what has piled up rather than grow without bound.
+        if (e.line.size() >= kLineMax) releaseLine(e);
+    }
+}
+
+// ------------------------------------------------------------------
+// End of life for the two sides
+// ------------------------------------------------------------------
+
+// read(A[1]) == 0: the terminal is gone. The program is not getting any more
+// input, and closing our end of the program pair is how it finds out.
+void termGone(Pty& e) {
+    // A real pty also hangs the session up at this point. Without it a shell
+    // outlives its terminal and keeps running with nowhere to read or write,
+    // which is what "closing the window leaves stray processes behind" looks
+    // like from the outside.
+    if (e.fg_pgrp > 0) signalFg(e, SIGHUP);
+
+    e.term_eof = true;
+    closeFd(e.term_fd);
+    closeFd(e.app_fd);
+    // An unclaimed slave can never be opened now that the master is gone.
+    closeFd(e.slave_fd);
+    e.app_eof = true;
+    e.line.clear();
+    e.to_app.clear();
+    e.to_term.clear();
+}
+
+// read(B[0]) == 0, or a write that nobody is there to take: every copy of the
+// slave is closed and the program side is finished.
+void appGone(Pty& e) {
+    e.app_eof = true;
+    closeFd(e.app_fd);
+    e.to_app.clear();
+}
+
+void flushToTerm(Pty& e) {
+    if (e.term_fd >= 0 && !drainQueue(e.term_fd, e.to_term)) termGone(e);
+}
+
+void flushToApp(Pty& e) {
+    if (e.app_fd >= 0 && !drainQueue(e.app_fd, e.to_app)) appGone(e);
+}
+
+void maybeReap(Pty& e) {
+    // The master is held open just long enough for the terminal to collect the
+    // output still queued behind it; closing it sooner would drop that.
+    if (e.app_eof && e.to_term.empty()) closeFd(e.term_fd);
+    if (e.term_fd < 0 && e.app_fd < 0 && e.slave_fd < 0) e = Pty();
+}
+
+// Every pty request names its pts in the first body word; the fd numbers the
+// client holds mean nothing on this side. The size is checked exactly, so a
+// truncated struct never reaches memcpy.
+Pty* ptyOfRequest(const Packet& req, size_t body_len) {
+    if (req.body.size() != body_len || body_len < 4) return nullptr;
+    return findByPts(static_cast<int>(get32(req.body.data())));
+}
+
 }  // namespace
 
 TtyServer::TtyServer(const std::string& path) : SockServer(path) {
     using namespace std::placeholders;
-    registerHandler(OP_PING,     std::bind(&TtyServer::onPing, this, _1, _2));
-    registerHandler(OP_PONG,     std::bind(&TtyServer::onPong, this, _1, _2));
-    registerHandler(OP_FORKPTY,  std::bind(&TtyServer::onForkpty, this, _1, _2));
-    registerHandler(OP_OPENPTMX, std::bind(&TtyServer::onOpenPtmx, this, _1, _2));
-    registerHandler(OP_OPENPTS,  std::bind(&TtyServer::onOpenPts, this, _1, _2));
+    registerHandler(OP_PING,       std::bind(&TtyServer::onPing, this, _1, _2));
+    registerHandler(OP_PONG,       std::bind(&TtyServer::onPong, this, _1, _2));
+    registerHandler(OP_FORKPTY,    std::bind(&TtyServer::onForkpty, this, _1, _2));
+    registerHandler(OP_OPENPTMX,   std::bind(&TtyServer::onOpenPtmx, this, _1, _2));
+    registerHandler(OP_OPENPTS,    std::bind(&TtyServer::onOpenPts, this, _1, _2));
+    registerHandler(OP_TCGETATTR,  std::bind(&TtyServer::onTcgetattr, this, _1, _2));
+    registerHandler(OP_TCSETATTR,  std::bind(&TtyServer::onTcsetattr, this, _1, _2));
+    registerHandler(OP_TCGETPGRP,  std::bind(&TtyServer::onTcgetpgrp, this, _1, _2));
+    registerHandler(OP_TCSETPGRP,  std::bind(&TtyServer::onTcsetpgrp, this, _1, _2));
+    registerHandler(OP_GETWINSZ,   std::bind(&TtyServer::onGetWinsz, this, _1, _2));
+    registerHandler(OP_SETWINSZ,   std::bind(&TtyServer::onSetWinsz, this, _1, _2));
 }
 
 bool TtyServer::onPing(const Packet& req, Reply& reply) {
@@ -80,28 +375,51 @@ bool TtyServer::onForkpty(const Packet& req, Reply& reply) {
 bool TtyServer::onOpenPtmx(const Packet& req, Reply& reply) {
     (void)req;
 
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    int a[2] = {-1, -1};
+    int b[2] = {-1, -1};
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, a) < 0) {
         fprintf(stderr, "[server] socketpair: %s\n", strerror(errno));
+        return false;
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, b) < 0) {
+        fprintf(stderr, "[server] socketpair: %s\n", strerror(errno));
+        close(a[0]);
+        close(a[1]);
         return false;
     }
 
     Pty* e = allocPty();
     if (!e) {
         fprintf(stderr, "[server] openptmx: out of pty slots\n");
-        close(sv[0]);
-        close(sv[1]);
+        close(a[0]); close(a[1]);
+        close(b[0]); close(b[1]);
         return false;
     }
 
+    setNonBlock(a[1]);
+    setNonBlock(b[0]);
+
     e->used = true;
     e->pts_n = g_next_pts++;
-    e->slave_fd = sv[1];
+    e->term_fd = a[1];
+    e->app_fd = b[0];
+    e->slave_fd = b[1];
+    // No foreground group until the client names one: the number would have to
+    // come from the client's process table, and guessing it is how a signal
+    // ends up in the wrong process. login_tty() names the real one right away.
+    e->fg_pgrp = 0;
+    e->term_eof = false;
+    e->app_eof = false;
+    e->line.clear();
+    e->to_app.clear();
+    e->to_term.clear();
+    initTermios(*e);
 
     // The client needs the pts number to build "/dev/pts/<n>" later.
     put32(reply.body, static_cast<uint32_t>(e->pts_n));
-    // The framework closes sv[0] once the kernel has taken its own reference.
-    reply.fds.push_back(sv[0]);
+    // The framework closes a[0] once the kernel has taken its own reference.
+    reply.fds.push_back(a[0]);
 
     fprintf(stderr, "[server] /dev/ptmx -> pts/%d (master handed over)\n", e->pts_n);
     return true;
@@ -116,19 +434,148 @@ bool TtyServer::onOpenPts(const Packet& req, Reply& reply) {
         fprintf(stderr, "[server] openpts: pts/%d not found\n", pts_n);
         return false;
     }
-
-    int fd = dup(e->slave_fd);
-    if (fd < 0) {
-        fprintf(stderr, "[server] openpts: dup: %s\n", strerror(errno));
+    if (e->slave_fd < 0) {
+        fprintf(stderr, "[server] openpts: pts/%d slave already handed over\n", pts_n);
         return false;
     }
-    reply.fds.push_back(fd);
 
-    // Both ends now live in the client, so let go of ours.
-    close(e->slave_fd);
+    reply.fds.push_back(e->slave_fd);
+    // Transferred, not copied: a second copy here would keep the master from
+    // ever seeing the program exit. The client reopens by name with a local dup
+    // of the fd it already has.
     e->slave_fd = -1;
-    e->used = false;
 
     fprintf(stderr, "[server] /dev/pts/%d -> slave handed over\n", pts_n);
     return true;
+}
+
+bool TtyServer::onTcgetattr(const Packet& req, Reply& reply) {
+    Pty* e = ptyOfRequest(req, 4);
+    if (!e) return false;
+
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&e->tio);
+    reply.body.insert(reply.body.end(), raw, raw + sizeof e->tio);
+    return true;
+}
+
+bool TtyServer::onTcsetattr(const Packet& req, Reply& reply) {
+    Pty* e = ptyOfRequest(req, 8 + sizeof(termios));
+    if (!e) return false;
+
+    // The action only chooses which queue to discard, and input is drained
+    // continuously here, so TCSANOW/TCSADRAIN/TCSAFLUSH all land in one place.
+    memcpy(&e->tio, req.body.data() + 8, sizeof e->tio);
+    return true;
+}
+
+bool TtyServer::onTcgetpgrp(const Packet& req, Reply& reply) {
+    Pty* e = ptyOfRequest(req, 4);
+    if (!e) return false;
+
+    put32(reply.body, static_cast<uint32_t>(e->fg_pgrp));
+    return true;
+}
+
+bool TtyServer::onTcsetpgrp(const Packet& req, Reply& reply) {
+    Pty* e = ptyOfRequest(req, 8);
+    if (!e) return false;
+
+    e->fg_pgrp = static_cast<pid_t>(get32(req.body.data() + 4));
+    return true;
+}
+
+bool TtyServer::onGetWinsz(const Packet& req, Reply& reply) {
+    Pty* e = ptyOfRequest(req, 4);
+    if (!e) return false;
+
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&e->ws);
+    reply.body.insert(reply.body.end(), raw, raw + sizeof e->ws);
+    return true;
+}
+
+bool TtyServer::onSetWinsz(const Packet& req, Reply& reply) {
+    Pty* e = ptyOfRequest(req, 4 + sizeof(winsize));
+    if (!e) return false;
+
+    winsize ws;
+    memcpy(&ws, req.body.data() + 4, sizeof ws);
+    bool changed = ws.ws_row != e->ws.ws_row || ws.ws_col != e->ws.ws_col;
+    // Stored before signalling: a program that handles SIGWINCH by asking for
+    // the new size must not be able to see the old one.
+    e->ws = ws;
+    // The kernel tells the program its window changed instead of making it
+    // poll, and a full-screen program that never hears about a resize is what a
+    // terminal that cannot be resized looks like from the inside.
+    if (changed) signalFg(*e, SIGWINCH);
+    return true;
+}
+
+void TtyServer::addPollFds(std::vector<pollfd>& fds) {
+    for (int i = 0; i < kMaxPtys; i++) {
+        Pty& e = g_pty[i];
+        if (!e.used) continue;
+
+        if (e.term_fd >= 0) {
+            short ev = POLLIN;
+            if (!e.to_term.empty()) ev = static_cast<short>(ev | POLLOUT);
+            // Reading ahead of a queue that is already full would break the
+            // backpressure: stop taking from the terminal until it drains.
+            if (e.to_app.size() >= kQueueMax) ev = static_cast<short>(ev & ~POLLIN);
+            fds.push_back(pollfd{e.term_fd, ev, 0});
+        }
+        if (e.app_fd >= 0) {
+            short ev = POLLIN;
+            if (!e.to_app.empty()) ev = static_cast<short>(ev | POLLOUT);
+            if (e.to_term.size() >= kQueueMax) ev = static_cast<short>(ev & ~POLLIN);
+            fds.push_back(pollfd{e.app_fd, ev, 0});
+        }
+    }
+}
+
+void TtyServer::pollEvent(int fd, short revents) {
+    Role role = Role::None;
+    Pty* e = ptyOwnedBy(fd, role);
+    if (!e) return;
+
+    if (role == Role::Term) {
+        if (revents & (POLLIN | POLLHUP | POLLERR)) {
+            uint8_t buf[4096];
+            while (e->to_app.size() < kQueueMax) {
+                ssize_t r = read(fd, buf, sizeof buf);
+                if (r > 0) {
+                    filterInput(*e, buf, static_cast<size_t>(r));
+                    continue;
+                }
+                if (r < 0 && errno == EINTR) continue;
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                // r == 0, or a read error: the terminal side is finished.
+                termGone(*e);
+                break;
+            }
+        }
+        if (e->term_fd >= 0 && (revents & POLLOUT)) flushToTerm(*e);
+    } else {
+        if (revents & (POLLIN | POLLHUP | POLLERR)) {
+            uint8_t buf[4096];
+            while (e->to_term.size() < kQueueMax) {
+                ssize_t r = read(fd, buf, sizeof buf);
+                if (r > 0) {
+                    filterOutput(*e, buf, static_cast<size_t>(r));
+                    continue;
+                }
+                if (r < 0 && errno == EINTR) continue;
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                appGone(*e);
+                break;
+            }
+        }
+        if (e->app_fd >= 0 && (revents & POLLOUT)) flushToApp(*e);
+    }
+
+    // Whatever the other direction is still owed goes out now: an input byte
+    // has to reach the program in the same round it was typed, or a terminal
+    // that is not being read would sit on the echo of its own keystrokes.
+    flushToApp(*e);
+    flushToTerm(*e);
+    maybeReap(*e);
 }

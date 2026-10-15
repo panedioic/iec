@@ -167,19 +167,27 @@ void SockServer::start() {
 void SockServer::run() {
     static constexpr size_t kMaxClients = 64;
 
-    std::vector<pollfd> fds{{listen_fd_, POLLIN, 0}};
     std::map<int, Conn> conns;
 
     while (running_) {
+        // Rebuilt from scratch every round rather than kept up to date: a
+        // derived class watches and drops fds between rounds, and a pollfd left
+        // over from a closed one is a use-after-free waiting to happen.
+        std::vector<pollfd> fds;
+        fds.push_back(pollfd{listen_fd_, POLLIN, 0});
+        for (const auto& kv : conns) fds.push_back(pollfd{kv.first, POLLIN, 0});
+        addPollFds(fds);
+
         int n = poll(fds.data(), fds.size(), 500);
         if (n < 0) { if (errno == EINTR) continue; break; }
         if (n == 0) continue;
 
         std::vector<int> to_close;
-        size_t cnt = fds.size();
-        for (size_t i = 0; i < cnt; ++i) {
-            if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+        for (size_t i = 0; i < fds.size(); ++i) {
+            short revents = fds[i].revents;
+            if (revents == 0) continue;
             int fd = fds[i].fd;
+
             if (fd == listen_fd_) {
                 int c = accept(listen_fd_, nullptr, nullptr);
                 if (c < 0) {
@@ -190,17 +198,24 @@ void SockServer::run() {
                         fprintf(stderr, "[server] accept: %s\n", strerror(errno));
                         usleep(10 * 1000);
                     }
-                } else if (fds.size() - 1 >= kMaxClients) {
+                } else if (conns.size() >= kMaxClients) {
                     // Without a cap, one client can exhaust the server's memory and fds.
                     fprintf(stderr, "[server] too many clients, dropping connection\n");
                     close(c);
                 } else {
-                    fds.push_back({c, POLLIN, 0});
                     conns[c];
                 }
                 continue;
             }
 
+            auto it = conns.find(fd);
+            if (it == conns.end()) {
+                // Not a connection, so a derived class owns it.
+                pollEvent(fd, revents);
+                continue;
+            }
+
+            if (!(revents & (POLLIN | POLLHUP | POLLERR))) continue;
             uint8_t tmp[4096];
             std::vector<int> got;
             ssize_t r = recvWithFds(fd, tmp, sizeof tmp, got);
@@ -210,7 +225,7 @@ void SockServer::run() {
                 to_close.push_back(fd);
                 continue;
             }
-            Conn& c = conns[fd];
+            Conn& c = it->second;
             // Fds are attached to the first byte of the message, which starts at
             // this offset in the connection's byte stream.
             if (!got.empty()) c.fds[c.consumed + c.buf.size()] = std::move(got);
@@ -225,12 +240,10 @@ void SockServer::run() {
                 for (auto& kv : it->second.fds) closeFds(kv.second);
                 conns.erase(it);
             }
-            for (size_t i = 0; i < fds.size(); ++i)
-                if (fds[i].fd == fd) { fds.erase(fds.begin() + i); break; }
         }
     }
 
-    for (size_t i = 1; i < fds.size(); ++i) close(fds[i].fd);
+    for (const auto& kv : conns) close(kv.first);
     for (auto& kv : conns)
         for (auto& pending : kv.second.fds) closeFds(pending.second);
 }

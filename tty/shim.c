@@ -5,12 +5,19 @@
 // domain socket. The server answers with real file descriptors (passed back with
 // SCM_RIGHTS), and those are returned to the caller as if it had opened them
 // locally. The fds are ordinary socketpair ends, so read()/write() work on them
-// with no further interception.
+// with no further interception -- which is why nothing here hooks read(): the
+// server holds the far end of both socketpairs and runs the line discipline
+// itself, the moment input arrives.
 //
-// What the client gets is not a tty, though, so the tty-flavoured calls
-// (isatty, tcgetattr/tcsetattr, the tty ioctls) are emulated here against a small
-// per-fd table. Everything that is not pty-related falls through to the real
-// libc function.
+// What the client gets is not a tty, though, so the tty-flavoured calls are
+// answered here. They fall into two groups. The ones that ask which terminal an
+// fd is (isatty, ttyname, TIOCGPTN, the byte routing of open()) are answered
+// from the local fd table. The ones that describe terminal state -- termios,
+// window size, foreground process group -- are asked of the server, which owns
+// that state because it is the only process that can act on it: it is the one
+// that sees every keystroke and the one that raises the signals.
+//
+// Everything that is not pty-related falls through to the real libc function.
 
 #include "intercept.h"
 #include "sock_client.h"
@@ -19,7 +26,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pty.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +34,7 @@
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
+/* login_tty() is declared here, not in pty.h. */
 #include <utmp.h>
 
 #define TTY_SOCK_PATH "/tmp/tty_service.sock"
@@ -41,7 +48,6 @@
  * __real_<name>, but the compiler still needs a declaration to reference it. */
 extern int __real_open(const char *, int, ...);
 extern int __real_close(int);
-extern ssize_t __real_read(int, void *, size_t);
 extern int __real_dup(int);
 extern int __real_dup2(int, int);
 extern int __real_dup3(int, int, int);
@@ -68,7 +74,6 @@ extern int __real_ttyname_r(int, char *, size_t);
 
 static int (*real_open)(const char *, int, ...);
 static int (*real_close)(int);
-static ssize_t (*real_read)(int, void *, size_t);
 static int (*real_dup)(int);
 static int (*real_dup2)(int, int);
 static int (*real_dup3)(int, int, int);
@@ -86,105 +91,48 @@ static char *(*real_ttyname)(int);
 static int (*real_ttyname_r)(int, char *, size_t);
 
 #define IEC_TTY_ENV   "IEC_TTY_PTS"
-#define SHIM_MAX_PTS  64
 
 /* ------------------------------------------------------------------ */
-/* Emulated tty state                                                  */
+/* fd table                                                            */
 /*                                                                     */
-/* The master and every slave fd of one pts share a single state block, */
-/* the way one line discipline backs both ends of a real pty: setting   */
-/* the window size on the master has to be visible through the slave.   */
+/* The client keeps only the mapping it cannot ask for: which pts a fd  */
+/* came from. Master and slave side of one pts share the number, so the */
+/* distinction is kept per fd, not per pts.                            */
 /* ------------------------------------------------------------------ */
-
-struct shim_tty {
-    int used;
-    int pts_n;              /* the "/dev/pts/<n>" number */
-    pid_t fg_pgrp;          /* emulated foreground process group (job control) */
-    struct termios tio;
-    struct winsize ws;
-};
-
-static struct shim_tty g_pts[SHIM_MAX_PTS];
 
 struct shim_fd {
     int used;
     int is_master;
-    struct shim_tty *st;
+    int pts_n;
 };
 
 static struct shim_fd g_fd[SHIM_MAX_FD];
 
-/* Returns the fd's state block, or NULL if this fd is not one of ours. */
-static struct shim_tty *tty_of(int fd) {
-    if (fd < 0 || fd >= SHIM_MAX_FD || !g_fd[fd].used) return NULL;
-    return g_fd[fd].st;
-}
-
-/* Returns the state block of an already known pts, without creating one. */
-static struct shim_tty *state_find(int pts_n) {
-    int i;
-    for (i = 0; i < SHIM_MAX_PTS; i++)
-        if (g_pts[i].used && g_pts[i].pts_n == pts_n) return &g_pts[i];
-    return NULL;
+/* Returns the pts number behind an fd, or -1 if this fd is not one of ours. */
+static int pts_of(int fd) {
+    if (fd < 0 || fd >= SHIM_MAX_FD || !g_fd[fd].used) return -1;
+    return g_fd[fd].pts_n;
 }
 
 /* Finds an fd in this process that is already bound to the given pts, so that
  * open("/dev/pts/<n>") can be answered with a dup instead of a round trip. A
  * shell reopens its terminal by name in every process it spawns, and the server
  * has long since given its copy of the slave away. */
-static int fd_for_pts(struct shim_tty *st, int want_master) {
+static int fd_for_pts(int pts_n, int want_master) {
     int fd;
     for (fd = 0; fd < SHIM_MAX_FD; fd++) {
-        if (!g_fd[fd].used || g_fd[fd].st != st) continue;
+        if (!g_fd[fd].used) continue;
+        if (g_fd[fd].pts_n != pts_n) continue;
         if (g_fd[fd].is_master == want_master) return fd;
     }
     return -1;
 }
 
-/* Finds or creates the state block for a pts number. */
-static struct shim_tty *state_get(int pts_n) {
-    struct shim_tty *s = NULL;
-    int i;
-
-    for (i = 0; i < SHIM_MAX_PTS; i++)
-        if (g_pts[i].used && g_pts[i].pts_n == pts_n) return &g_pts[i];
-    for (i = 0; i < SHIM_MAX_PTS; i++)
-        if (!g_pts[i].used) { s = &g_pts[i]; break; }
-    if (!s) return NULL;
-
-    memset(s, 0, sizeof *s);
-    s->used = 1;
-    s->pts_n = pts_n;
-    /* A foreground group of 0 means "none", which makes a shell think another
-     * process owns the terminal; start out owning it ourselves. */
-    s->fg_pgrp = getpgrp();
-    /* A plain cooked terminal, i.e. what openpty() would leave behind. */
-    s->tio.c_iflag = ICRNL | IXON;
-    s->tio.c_oflag = OPOST | ONLCR;
-    s->tio.c_cflag = CS8 | CREAD | CLOCAL;
-    s->tio.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
-    s->tio.c_cc[VMIN] = 1;
-    s->tio.c_cc[VTIME] = 0;
-    /* The control characters matter as much as the flags here: the struct was
-     * memset, so without these VERASE would be NUL and backspace would be
-     * treated as an erase request for every NUL byte typed. */
-    s->tio.c_cc[VINTR] = 0x03;    /* ^C  */
-    s->tio.c_cc[VQUIT] = 0x1c;    /* ^\  */
-    s->tio.c_cc[VERASE] = 0x7f;   /* DEL */
-    s->tio.c_cc[VKILL] = 0x15;    /* ^U  */
-    s->tio.c_cc[VEOF] = 0x04;     /* ^D  */
-    s->tio.c_cc[VSUSP] = 0x1a;    /* ^Z  */
-    s->ws.ws_row = 24;
-    s->ws.ws_col = 80;
-    return s;
-}
-
 static void tty_set(int fd, int pts_n, int is_master) {
-    struct shim_tty *s = state_get(pts_n);
-    if (fd < 0 || fd >= SHIM_MAX_FD || !s) return;
+    if (fd < 0 || fd >= SHIM_MAX_FD) return;
     g_fd[fd].used = 1;
     g_fd[fd].is_master = is_master;
-    g_fd[fd].st = s;
+    g_fd[fd].pts_n = pts_n;
 }
 
 static void tty_clear(int fd) {
@@ -202,21 +150,18 @@ static void tty_copy(int from, int to) {
 /* forkpty()'s child almost always execs something else, and this table does not
  * survive an exec. login_tty() records the pts number in the environment, and
  * this constructor rebuilds the mapping for fds 0..2 in the new image, so that
- * the shell still sees a tty. */
+ * the shell still sees a tty. The terminal state itself is on the server and
+ * needs no rebuilding. */
 __attribute__((constructor))
 static void shim_resume_from_exec(void) {
     const char *env = getenv(IEC_TTY_ENV);
-    struct shim_tty *s;
-    int fd;
+    int n, fd;
 
     if (!env || *env < '0' || *env > '9') return;
-    s = state_get(atoi(env));
-    if (!s) return;
+    n = atoi(env);
     for (fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
         if (fcntl(fd, F_GETFD) < 0) continue;
-        g_fd[fd].used = 1;
-        g_fd[fd].is_master = 0;
-        g_fd[fd].st = s;
+        tty_set(fd, n, 0);
     }
 }
 
@@ -234,6 +179,63 @@ static void body_put32(uint8_t *p, uint32_t v) {
     p[1] = (uint8_t)(v >> 16);
     p[2] = (uint8_t)(v >> 8);
     p[3] = (uint8_t)v;
+}
+
+/* Sends one request and returns 0, or -1 with errno set on failure. The reply
+ * body is copied into out (at most out_max bytes) and its real length is left in
+ * out_len when out_len is not NULL. */
+static int rpc_call(uint32_t op, const void *body, uint32_t len,
+                    void *out, uint32_t out_max, uint32_t *out_len) {
+    sock_client c;
+    sock_reply r;
+    int rc;
+
+    if (sock_connect(&c, TTY_SOCK_PATH) < 0) {
+        fprintf(stderr, "[shim] connect %s failed: %s\n", TTY_SOCK_PATH, strerror(errno));
+        errno = EIO;
+        return -1;
+    }
+
+    rc = sock_call(&c, op, body, len, &r);
+    if (rc < 0) {
+        fprintf(stderr, "[shim] op %u failed: %s\n", (unsigned)op, strerror(errno));
+        sock_close(&c);
+        errno = EIO;
+        return -1;
+    }
+    if (rc > 0) {
+        fprintf(stderr, "[shim] op %u: server error: %s\n", (unsigned)op,
+                r.body ? (char *)r.body : "(no message)");
+        sock_reply_free(&r);
+        sock_close(&c);
+        errno = EIO;
+        return -1;
+    }
+
+    if (out_len) *out_len = r.len;
+    if (out && r.len) {
+        uint32_t n = r.len < out_max ? r.len : out_max;
+        memcpy(out, r.body, n);
+    }
+    sock_reply_free(&r);
+    sock_close(&c);
+    return 0;
+}
+
+/* Same, for a reply that is one struct: a short answer would leave a
+ * half-initialised struct behind, so the length has to match exactly. */
+static int rpc_fixed(uint32_t op, const uint8_t *req, uint32_t len,
+                     void *out, uint32_t out_size) {
+    uint32_t got = 0;
+
+    if (rpc_call(op, req, len, out, out_size, &got) < 0) return -1;
+    if (got != out_size) {
+        fprintf(stderr, "[shim] op %u: reply is %u bytes, expected %u\n",
+                (unsigned)op, (unsigned)got, (unsigned)out_size);
+        errno = EIO;
+        return -1;
+    }
+    return 0;
 }
 
 /* Sends one request and returns the fd the server sent back (-1 on failure).
@@ -282,6 +284,55 @@ static int rpc_take_fd(uint32_t op, const void *body, uint32_t len, uint32_t *ou
 }
 
 /* ------------------------------------------------------------------ */
+/* Terminal state, as held by the server                               */
+/* ------------------------------------------------------------------ */
+
+static void req_pts(uint8_t *req, int pts_n) {
+    body_put32(req, (uint32_t)pts_n);
+}
+
+static int pts_tcgetattr(int pts_n, struct termios *tio) {
+    uint8_t req[4];
+    req_pts(req, pts_n);
+    return rpc_fixed(OP_TCGETATTR, req, sizeof req, tio, sizeof *tio);
+}
+
+static int pts_tcsetattr(int pts_n, int actions, const struct termios *tio) {
+    uint8_t req[8 + sizeof *tio];
+    req_pts(req, pts_n);
+    body_put32(req + 4, (uint32_t)actions);
+    memcpy(req + 8, tio, sizeof *tio);
+    return rpc_call(OP_TCSETATTR, req, sizeof req, NULL, 0, NULL);
+}
+
+static pid_t pts_tcgetpgrp(int pts_n) {
+    uint8_t req[4], resp[4];
+    req_pts(req, pts_n);
+    if (rpc_fixed(OP_TCGETPGRP, req, sizeof req, resp, sizeof resp) < 0) return -1;
+    return (pid_t)body_get32(resp);
+}
+
+static int pts_tcsetpgrp(int pts_n, pid_t pgrp) {
+    uint8_t req[8];
+    req_pts(req, pts_n);
+    body_put32(req + 4, (uint32_t)pgrp);
+    return rpc_call(OP_TCSETPGRP, req, sizeof req, NULL, 0, NULL);
+}
+
+static int pts_getwinsz(int pts_n, struct winsize *ws) {
+    uint8_t req[4];
+    req_pts(req, pts_n);
+    return rpc_fixed(OP_GETWINSZ, req, sizeof req, ws, sizeof *ws);
+}
+
+static int pts_setwinsz(int pts_n, const struct winsize *ws) {
+    uint8_t req[4 + sizeof *ws];
+    req_pts(req, pts_n);
+    memcpy(req + 4, ws, sizeof *ws);
+    return rpc_call(OP_SETWINSZ, req, sizeof req, NULL, 0, NULL);
+}
+
+/* ------------------------------------------------------------------ */
 /* Hooks                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -299,7 +350,6 @@ int IEC_EXPORT(open)(const char *path, int flags, ...) {
     if (strncmp(path, PTS_PREFIX, PTS_PREFIX_LEN) == 0) {
         const char *num = path + PTS_PREFIX_LEN;
         uint8_t req[4];
-        struct shim_tty *st;
         int n, local;
 
         if (*num < '0' || *num > '9') {
@@ -309,18 +359,12 @@ int IEC_EXPORT(open)(const char *path, int flags, ...) {
         n = atoi(num);
 
         /* If this process already holds the slave end, dup it: the server gave
-         * its own copy away on the first open and will not have another. */
-        st = state_find(n);
-        if (st) {
-            local = fd_for_pts(st, 0);
-            if (local >= 0) {
-                fd = dup(local);
-                if (fd >= 0) {
-                    tty_set(fd, n, 0);
-                    return fd;
-                }
-                return -1;
-            }
+         * its own copy away on the first open and has no second one. */
+        local = fd_for_pts(n, 0);
+        if (local >= 0) {
+            fd = dup(local);
+            if (fd >= 0) tty_set(fd, n, 0);
+            return fd;
         }
 
         body_put32(req, (uint32_t)n);
@@ -347,167 +391,6 @@ int IEC_EXPORT(close)(int fd) {
     tty_clear(fd);
     RESOLVE(real_close, close);
     return real_close(fd);
-}
-
-/* The line discipline.
- *
- * A real pty runs two filters around the fd pair. Output: OPOST|ONLCR turns each
- * "\n" a program writes into "\r\n" on its way to the terminal. Input: control
- * characters become signals, CR folds to NL, canonical mode assembles whole
- * lines, and what was typed is echoed back.
- *
- * Neither happens over a plain socketpair, so both are reproduced here. The
- * output half runs on the master's read path, the one place both injection modes
- * reach it (the shell in warp mode is not wrapped). The input half has to run on
- * the slave's read path instead: only the process doing the read holds the live
- * termios -- readline edits its own copy -- and knows which process group should
- * get the signals.
- */
-
-#define LINE_MAX 4096
-
-/* Canonical-mode input being assembled, one buffer per pts. */
-static unsigned char g_line[SHIM_MAX_PTS][LINE_MAX];
-static size_t g_line_len[SHIM_MAX_PTS];
-static int g_line_ready[SHIM_MAX_PTS];
-
-static int state_index(const struct shim_tty *t) {
-    return (int)(t - g_pts);
-}
-
-static void line_put(int idx, unsigned char c) {
-    if (g_line_len[idx] < LINE_MAX) {
-        g_line[idx][g_line_len[idx]++] = c;
-    } else {
-        /* Line limit reached: release what we have so the reader can drain it
-         * instead of deadlocking on a line that can never complete. */
-        g_line_ready[idx] = 1;
-    }
-}
-
-/* Writes a typed character back out through the slave fd, i.e. to the master, so
- * the emulator draws it. Best effort: there is nothing useful to do if the
- * terminal has gone away. */
-static void input_echo(struct shim_tty *t, int fd, unsigned char c) {
-    if ((t->tio.c_lflag & ECHOCTL) && c < 0x20 && c != '\t' && c != '\n') {
-        unsigned char out[2];
-        out[0] = '^';
-        out[1] = (unsigned char)(c + '@');
-        if (write(fd, out, 2) != 2) return;
-        return;
-    }
-    if (write(fd, &c, 1) != 1) return;
-}
-
-static void input_erase_echo(int fd) {
-    if (write(fd, "\b \b", 3) != 3) return;
-}
-
-static void input_filter(struct shim_tty *t, int fd, const unsigned char *in, size_t len) {
-    int idx = state_index(t);
-    int canon = (t->tio.c_lflag & ICANON) != 0;
-    int echo = (t->tio.c_lflag & ECHO) != 0;
-    size_t i;
-
-    for (i = 0; i < len; i++) {
-        unsigned char c = in[i];
-
-        if ((t->tio.c_iflag & ICRNL) && c == '\r') c = '\n';
-
-        if ((t->tio.c_lflag & ISIG) &&
-            (c == t->tio.c_cc[VINTR] || c == t->tio.c_cc[VQUIT] ||
-             c == t->tio.c_cc[VSUSP])) {
-            int sig = c == t->tio.c_cc[VINTR] ? SIGINT
-                    : c == t->tio.c_cc[VQUIT] ? SIGQUIT
-                                              : SIGTSTP;
-            if (echo) input_echo(t, fd, c);
-            /* Signal the foreground group, but only inside our own session. A
-             * stale or bogus group number must never reach unrelated processes:
-             * the terminal, the shell that started it, or this agent's own
-             * shell are all one bad kill(-n) away. */
-            if (t->fg_pgrp > 0 && getsid(t->fg_pgrp) == getsid(0))
-                kill(-t->fg_pgrp, sig);
-            g_line_len[idx] = 0;   /* the partly typed line is discarded */
-            continue;
-        }
-
-        if (canon && t->tio.c_cc[VERASE] != _POSIX_VDISABLE &&
-            c == t->tio.c_cc[VERASE]) {
-            if (g_line_len[idx] > 0) {
-                g_line_len[idx]--;
-                if (echo && (t->tio.c_lflag & ECHOE)) input_erase_echo(fd);
-            }
-            continue;
-        }
-
-        line_put(idx, c);
-        if (echo || (canon && (t->tio.c_lflag & ECHONL) && c == '\n'))
-            input_echo(t, fd, c);
-
-        if (!canon || c == '\n') g_line_ready[idx] = 1;
-    }
-}
-
-ssize_t IEC_EXPORT(read)(int fd, void *buf, size_t n) {
-    struct shim_tty *t = tty_of(fd);
-    unsigned char *b = buf;
-    size_t room, i, o, produced;
-    ssize_t r;
-
-    RESOLVE(real_read, read);
-
-    if (!t) return real_read(fd, buf, n);
-
-    /* is_master is per fd, not per pts: the state block is shared by both ends,
-     * and only the fd opened through /dev/ptmx carries the master's output. */
-    if (g_fd[fd].is_master) {
-        /* Output half. The raw bytes go into the second half of the caller's
-         * buffer and the expanded result into the first, so the two never
-         * overlap; reading at most half the buffer guarantees every newline has
-         * room to double. That is what lets this work without a pending buffer
-         * -- holding bytes back would make poll()/epoll() stop reporting the fd
-         * as readable while data was still owed to the caller. */
-        if (n < 2 || !(t->tio.c_oflag & OPOST) || !(t->tio.c_oflag & ONLCR))
-            return real_read(fd, buf, n);
-
-        room = n / 2;
-        r = real_read(fd, b + room, room);
-        if (r <= 0) return r;
-
-        for (i = 0, o = 0; i < (size_t)r; i++) {
-            if (b[room + i] == '\n') b[o++] = '\r';
-            b[o++] = b[room + i];
-        }
-        return (ssize_t)o;
-    }
-
-    /* Input half. Blocking here while a line is still incomplete is correct: a
-     * canonical read() is supposed to wait for one. */
-    for (;;) {
-        int idx = state_index(t);
-
-        if (g_line_ready[idx]) {
-            produced = 0;
-            while (g_line_ready[idx] && produced < n) {
-                size_t take = g_line_len[idx];
-                if (take > n - produced) take = n - produced;
-                memcpy(b + produced, g_line[idx], take);
-                memmove(g_line[idx], g_line[idx] + take, g_line_len[idx] - take);
-                g_line_len[idx] -= take;
-                produced += take;
-                if (g_line_len[idx] == 0) g_line_ready[idx] = 0;
-            }
-            return (ssize_t)produced;
-        }
-
-        {
-            unsigned char tmp[512];
-            r = real_read(fd, tmp, sizeof tmp);
-            if (r < 0) return -1;
-            if (r == 0) return 0;
-            input_filter(t, fd, tmp, (size_t)r);
-        }
-    }
 }
 
 /* Duplicating a tty fd has to carry the table entry over, otherwise the copy is
@@ -568,7 +451,7 @@ int IEC_EXPORT(fcntl)(int fd, int cmd, ...) {
 }
 
 int IEC_EXPORT(isatty)(int fd) {
-    if (tty_of(fd)) return 1;
+    if (pts_of(fd) >= 0) return 1;
     RESOLVE(real_isatty, isatty);
     return real_isatty(fd);
 }
@@ -580,50 +463,53 @@ int IEC_EXPORT(isatty)(int fd) {
  * it cannot get one ("cannot set terminal process group"). */
 char *IEC_EXPORT(ttyname)(int fd) {
     static char buf[32];
-    struct shim_tty *t = tty_of(fd);
+    int n = pts_of(fd);
 
-    if (!t) {
+    if (n < 0) {
         RESOLVE(real_ttyname, ttyname);
         return real_ttyname(fd);
     }
-    snprintf(buf, sizeof buf, "/dev/pts/%d", t->pts_n);
+    snprintf(buf, sizeof buf, "/dev/pts/%d", n);
     return buf;
 }
 
 int IEC_EXPORT(ttyname_r)(int fd, char *buf, size_t buflen) {
-    struct shim_tty *t = tty_of(fd);
-    int n;
+    int n = pts_of(fd);
+    int len;
 
-    if (!t) {
+    if (n < 0) {
         RESOLVE(real_ttyname_r, ttyname_r);
         return real_ttyname_r(fd, buf, buflen);
     }
-    n = snprintf(buf, buflen, "/dev/pts/%d", t->pts_n);
-    if (n < 0) return errno;
-    if ((size_t)n >= buflen) return ERANGE;
+    len = snprintf(buf, buflen, "/dev/pts/%d", n);
+    if (len < 0) return errno;
+    if ((size_t)len >= buflen) return ERANGE;
     return 0;
 }
 
 int IEC_EXPORT(tcgetattr)(int fd, struct termios *tio) {
-    struct shim_tty *t = tty_of(fd);
-    if (t) {
-        if (!tio) { errno = EFAULT; return -1; }
-        *tio = t->tio;
-        return 0;
+    int n = pts_of(fd);
+    struct termios got;
+
+    if (n < 0) {
+        RESOLVE(real_tcgetattr, tcgetattr);
+        return real_tcgetattr(fd, tio);
     }
-    RESOLVE(real_tcgetattr, tcgetattr);
-    return real_tcgetattr(fd, tio);
+    if (!tio) { errno = EFAULT; return -1; }
+    if (pts_tcgetattr(n, &got) < 0) return -1;
+    *tio = got;
+    return 0;
 }
 
 int IEC_EXPORT(tcsetattr)(int fd, int actions, const struct termios *tio) {
-    struct shim_tty *t = tty_of(fd);
-    if (t) {
-        if (!tio) { errno = EFAULT; return -1; }
-        t->tio = *tio;
-        return 0;
+    int n = pts_of(fd);
+
+    if (n < 0) {
+        RESOLVE(real_tcsetattr, tcsetattr);
+        return real_tcsetattr(fd, actions, tio);
     }
-    RESOLVE(real_tcsetattr, tcsetattr);
-    return real_tcsetattr(fd, actions, tio);
+    if (!tio) { errno = EFAULT; return -1; }
+    return pts_tcsetattr(n, actions, tio);
 }
 
 /* tcgetpgrp()/tcsetpgrp() have to be hooked on their own: glibc implements them
@@ -632,24 +518,27 @@ int IEC_EXPORT(tcsetattr)(int fd, int actions, const struct termios *tio) {
  * and when they fail it prints "cannot set terminal process group" and gives up
  * job control entirely. */
 pid_t IEC_EXPORT(tcgetpgrp)(int fd) {
-    struct shim_tty *t = tty_of(fd);
-    if (t) return t->fg_pgrp;
-    RESOLVE(real_tcgetpgrp, tcgetpgrp);
-    return real_tcgetpgrp(fd);
+    int n = pts_of(fd);
+
+    if (n < 0) {
+        RESOLVE(real_tcgetpgrp, tcgetpgrp);
+        return real_tcgetpgrp(fd);
+    }
+    return pts_tcgetpgrp(n);
 }
 
 int IEC_EXPORT(tcsetpgrp)(int fd, pid_t pgrp) {
-    struct shim_tty *t = tty_of(fd);
-    if (t) {
-        t->fg_pgrp = pgrp;
-        return 0;
+    int n = pts_of(fd);
+
+    if (n < 0) {
+        RESOLVE(real_tcsetpgrp, tcsetpgrp);
+        return real_tcsetpgrp(fd, pgrp);
     }
-    RESOLVE(real_tcsetpgrp, tcsetpgrp);
-    return real_tcsetpgrp(fd, pgrp);
+    return pts_tcsetpgrp(n, pgrp);
 }
 
 int IEC_EXPORT(ioctl)(int fd, unsigned long request, ...) {
-    struct shim_tty *t = tty_of(fd);
+    int n = pts_of(fd);
     void *arg;
     va_list ap;
 
@@ -657,25 +546,26 @@ int IEC_EXPORT(ioctl)(int fd, unsigned long request, ...) {
     arg = va_arg(ap, void *);
     va_end(ap);
 
-    if (t) {
+    if (n >= 0) {
         switch (request) {
         case TIOCGWINSZ:
-            if (arg) *(struct winsize *)arg = t->ws;
-            return 0;
+            if (!arg) { errno = EFAULT; return -1; }
+            return pts_getwinsz(n, arg);
         case TIOCSWINSZ:
-            if (arg) t->ws = *(const struct winsize *)arg;
-            return 0;
+            if (!arg) { errno = EFAULT; return -1; }
+            return pts_setwinsz(n, arg);
+        /* The ioctl spellings of the termios calls go to the same place. */
         case TCGETS:
-            if (arg) *(struct termios *)arg = t->tio;
-            return 0;
+            if (!arg) { errno = EFAULT; return -1; }
+            return pts_tcgetattr(n, arg);
         case TCSETS:
         case TCSETSW:
         case TCSETSF:
-            if (arg) t->tio = *(const struct termios *)arg;
-            return 0;
+            if (!arg) { errno = EFAULT; return -1; }
+            return pts_tcsetattr(n, TCSANOW, arg);
 #ifdef TIOCGPTN
         case TIOCGPTN:
-            if (arg) *(int *)arg = t->pts_n;
+            if (arg) *(int *)arg = n;
             return 0;
 #endif
 #ifdef TIOCSCTTY
@@ -686,13 +576,18 @@ int IEC_EXPORT(ioctl)(int fd, unsigned long request, ...) {
          * tcsetpgrp()/tcgetpgrp(); glibc's own wrappers bypass this hook. */
 #ifdef TIOCSPGRP
         case TIOCSPGRP:
-            if (arg) t->fg_pgrp = *(const pid_t *)arg;
-            return 0;
+            if (!arg) { errno = EFAULT; return -1; }
+            return pts_tcsetpgrp(n, *(const pid_t *)arg);
 #endif
 #ifdef TIOCGPGRP
-        case TIOCGPGRP:
-            if (arg) *(pid_t *)arg = t->fg_pgrp;
+        case TIOCGPGRP: {
+            pid_t p;
+            if (!arg) { errno = EFAULT; return -1; }
+            p = pts_tcgetpgrp(n);
+            if (p < 0) return -1;
+            *(pid_t *)arg = p;
             return 0;
+        }
 #endif
         default:
             break;
@@ -710,26 +605,26 @@ int IEC_EXPORT(getpt)(void) {
 int IEC_EXPORT(grantpt)(int fd) {
     /* Nothing to do: the server already owns the "slave" and hands it over on
      * open("/dev/pts/<n>"). */
-    if (tty_of(fd)) return 0;
+    if (pts_of(fd) >= 0) return 0;
     RESOLVE(real_grantpt, grantpt);
     return real_grantpt(fd);
 }
 
 int IEC_EXPORT(unlockpt)(int fd) {
-    if (tty_of(fd)) return 0;
+    if (pts_of(fd) >= 0) return 0;
     RESOLVE(real_unlockpt, unlockpt);
     return real_unlockpt(fd);
 }
 
 char *IEC_EXPORT(ptsname)(int fd) {
     static char buf[32];
-    struct shim_tty *t = tty_of(fd);
+    int n = pts_of(fd);
 
-    if (!t) {
+    if (n < 0) {
         RESOLVE(real_ptsname, ptsname);
         return real_ptsname(fd);
     }
-    snprintf(buf, sizeof buf, "/dev/pts/%d", t->pts_n);
+    snprintf(buf, sizeof buf, "/dev/pts/%d", n);
     return buf;
 }
 
@@ -768,29 +663,28 @@ int IEC_EXPORT(openpty)(int *amaster, int *aslave, char *name,
 }
 
 int IEC_EXPORT(login_tty)(int fd) {
+    int n;
+
     if (setsid() < 0) return -1;
     if (ioctl(fd, TIOCSCTTY, NULL) < 0) return -1;
     if (dup2(fd, STDIN_FILENO) < 0) return -1;
     if (dup2(fd, STDOUT_FILENO) < 0) return -1;
     if (dup2(fd, STDERR_FILENO) < 0) return -1;
-    tty_copy(fd, STDIN_FILENO);
-    tty_copy(fd, STDOUT_FILENO);
-    tty_copy(fd, STDERR_FILENO);
 
-    /* The child almost always execs right after this, and the table above does
-     * not cross that boundary; leave the pts number where the next image can
-     * find it (see shim_resume_from_exec). */
-    {
-        struct shim_tty *t = tty_of(fd);
-        if (t) {
-            char v[16];
-            snprintf(v, sizeof v, "%d", t->pts_n);
-            setenv(IEC_TTY_ENV, v, 1);
-            /* setsid() above gave this process its own group; the state block was
-             * built in the parent and still names the parent's group, and acting
-             * on that would signal the wrong processes. */
-            t->fg_pgrp = getpgrp();
-        }
+    n = pts_of(fd);
+    if (n >= 0) {
+        char v[16];
+        snprintf(v, sizeof v, "%d", n);
+        /* The child almost always execs right after this, and the table above
+         * does not cross that boundary; leave the pts number where the next
+         * image can find it (see shim_resume_from_exec). */
+        setenv(IEC_TTY_ENV, v, 1);
+        /* The server owns the foreground group and is the only process that can
+         * raise a signal for this terminal, so setsid() -- which just gave this
+         * process a group the server has never heard of -- has to be reported.
+         * A real pty picks up the new session's group at this point as well;
+         * without this, ^C would have nobody to signal. */
+        tcsetpgrp(fd, getpgrp());
     }
 
     if (fd > STDERR_FILENO) close(fd);

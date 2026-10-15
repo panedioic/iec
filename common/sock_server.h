@@ -15,6 +15,8 @@
 // Declarations only; the definitions live in common/sock_server.cpp.
 #pragma once
 
+#include <poll.h>
+
 #include <cstddef>
 #include <csignal>
 #include <cstdint>
@@ -82,6 +84,17 @@ public:
     void run();
 
     void stop();
+
+protected:
+    // Fds a derived class owns (the pty pairs, for the tty server). run()
+    // rebuilds the whole poll set every round and only knows about the listen
+    // socket and the client connections, so anything that has to be watched
+    // must be appended again on every call.
+    virtual void addPollFds(std::vector<pollfd>& fds) { (void)fds; }
+
+    // Called for a ready fd that is neither the listen socket nor a client
+    // connection, i.e. one added by addPollFds.
+    virtual void pollEvent(int fd, short revents) { (void)fd; (void)revents; }
 
 private:
     // Per-connection receive state.
