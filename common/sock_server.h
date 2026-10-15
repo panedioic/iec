@@ -8,6 +8,10 @@
 //     [12-15] Reserved
 //     [16..] Packet content
 //
+// File descriptors travel out of band: they are attached with SCM_RIGHTS to the
+// same message as the bytes of one packet, and are not counted in any length.
+// A message carrying fds must therefore contain exactly one whole packet.
+//
 // Declarations only; the definitions live in common/sock_server.cpp.
 #pragma once
 
@@ -23,6 +27,8 @@ constexpr uint32_t kHeaderLen = 16;
 constexpr uint16_t kVersion = 1;
 constexpr uint32_t kMaxPacketLen = 1u << 20;
 constexpr uint32_t kOpError = 0xFFFFFFFF;
+// Caps both the SCM_RIGHTS payload of one message and Reply::fds.
+constexpr int kMaxFds = 8;
 
 struct Packet {
     uint32_t length = 0;      // Total length
@@ -31,6 +37,16 @@ struct Packet {
     uint32_t op = 0;
     uint32_t reserved = 0;
     std::vector<uint8_t> body;  // Content
+    // Fds that arrived with this packet. The framework owns them and closes them
+    // as soon as the handler returns, so dup any you want to keep.
+    std::vector<int> fds;
+};
+
+// What a handler answers with. The framework sends body as the packet body and
+// fds over SCM_RIGHTS, then closes every fd listed here.
+struct Reply {
+    std::vector<uint8_t> body;
+    std::vector<int> fds;
 };
 
 void put32(std::vector<uint8_t>& v, uint32_t x);
@@ -48,8 +64,8 @@ std::vector<uint8_t> encode(uint32_t op, const std::vector<uint8_t>& body);
 
 class SockServer {
 public:
-    // Handler: read req and write the response content into reply; returning false means the handler failed (an error packet is sent back)
-    using Handler = std::function<bool(const Packet& req, std::vector<uint8_t>& reply)>;
+    // Handler: read req and fill in reply; returning false means the handler failed (an error packet is sent back)
+    using Handler = std::function<bool(const Packet& req, Reply& reply)>;
 
     explicit SockServer(std::string path);
     virtual ~SockServer();
@@ -68,8 +84,19 @@ public:
     void stop();
 
 private:
+    // Per-connection receive state.
+    struct Conn {
+        std::vector<uint8_t> buf;
+        // Absolute stream offset of buf.front(), i.e. how many bytes this
+        // connection has already consumed.
+        uint64_t consumed = 0;
+        // Fds that arrived but whose packet is not complete yet, keyed by the
+        // absolute stream offset they were attached to.
+        std::map<uint64_t, std::vector<int>> fds;
+    };
+
     // Extract all complete packets from the buffer and dispatch them; returning false means the connection should be closed
-    bool drain(int fd, std::vector<uint8_t>& b);
+    bool drain(int fd, Conn& c);
 
     static const char* validate(const Packet& p);
 
@@ -77,7 +104,9 @@ private:
 
     void sendError(int fd, const char* msg);
 
-    static void sendAll(int fd, const std::vector<uint8_t>& d);
+    static void sendAll(int fd, const std::vector<uint8_t>& d, const std::vector<int>& fds);
+
+    static void closeFds(std::vector<int>& fds);
 
     std::string path_;
     int listen_fd_ = -1;

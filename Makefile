@@ -26,12 +26,21 @@ BUILD := build
 CFLAGS   += -Wall -Icommon -D_GNU_SOURCE
 CXXFLAGS += -Wall -Icommon
 SHIM_SRC := tty/shim.c
-SHIM_HDR := common/intercept.h common/sock_client.h
+SHIM_HDR := common/intercept.h common/sock_client.h common/sock_operation.h
 SOCK_SRC := common/sock_client.c
+SOCK_HDR := common/sock_client.h
+
+# Every pty entry point the shim takes over. MODE=warp needs a --wrap for each,
+# so that calls from the client are redirected to __wrap_<name>; MODE=preload
+# interposes them by symbol name instead and needs none of these.
+SHIM_WRAPS := open close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r \
+              tcgetattr tcsetattr tcgetpgrp tcsetpgrp getpt grantpt unlockpt \
+              ptsname openpty login_tty forkpty
+WRAP_FLAGS := $(foreach s,$(SHIM_WRAPS),-Wl,--wrap=$(s))
 
 SERVER_BIN  := $(DIST)/tty_server
 SERVER_SRCS := main.cpp tty/tty_server.cpp common/sock_server.cpp
-SERVER_HDR  := tty/tty_server.h common/sock_server.h
+SERVER_HDR  := tty/tty_server.h common/sock_server.h common/sock_operation.h
 
 ifeq ($(MODE),warp)
   TARGET := $(DIST)/weston-terminal-wrap
@@ -63,16 +72,16 @@ run-server: $(SERVER_BIN)
 $(BUILD)/shim_tty.o: $(SHIM_SRC) $(SHIM_HDR) | $(BUILD)
 	$(CC) $(CFLAGS) -DINT_WARP -fPIC -c $< -o $@
 
-$(BUILD)/sock_client.o: $(SOCK_SRC) common/sock_client.h | $(BUILD)
+$(BUILD)/sock_client.o: $(SOCK_SRC) $(SOCK_HDR) | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
-$(DIST)/shim_tty.so: $(SHIM_SRC) $(SHIM_HDR) $(SOCK_SRC) | $(DIST)
+$(DIST)/shim_tty.so: $(SHIM_SRC) $(SHIM_HDR) $(SOCK_SRC) $(SOCK_HDR) | $(DIST)
 	$(CC) $(CFLAGS) -DINT_PRELOAD -shared -fPIC $(SHIM_SRC) $(SOCK_SRC) -o $@ -ldl
 
 # --wrap only takes effect at link time and does nothing for an already-built executable, so the shim must be relinked together with the client
 $(DIST)/weston-terminal-wrap: $(BUILD)/shim_tty.o $(BUILD)/sock_client.o scripts/build_client.sh | $(DIST)
 	WESTON_SRC=$(WESTON_SRC) scripts/build_client.sh -o $@ \
-		-Wl,--wrap=forkpty $(BUILD)/shim_tty.o $(BUILD)/sock_client.o
+		$(WRAP_FLAGS) $(BUILD)/shim_tty.o $(BUILD)/sock_client.o
 
 run: all
 	$(RUN)

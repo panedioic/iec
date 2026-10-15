@@ -1,4 +1,7 @@
-// common/sock_client.h UDS client common library: connect, encode, send/receive. Each business client embeds sock_client in its own struct to reuse it.
+// common/sock_client.h UDS client library: connect, encode, send/receive.
+// Business clients embed a sock_client in their own struct to reuse it.
+//
+// Replies may carry file descriptors (SCM_RIGHTS); they land in sock_reply::fds.
 #ifndef SOCK_CLIENT_H
 #define SOCK_CLIENT_H
 #include <stdint.h>
@@ -7,23 +10,36 @@
 #define SOCK_VERSION   1
 #define SOCK_OP_ERROR  0xFFFFFFFFu
 
+/* Maximum fds a single reply may carry. */
+#define SOCK_MAX_FDS   8
+
 typedef struct {
     int      fd;
-    uint16_t version;       /* protocol version used when sending, defaults to SOCK_VERSION, can be changed to test malformed packets */
+    uint16_t version;       /* protocol version used when sending; SOCK_VERSION by default, change it to test bad packets */
 } sock_client;
 
 typedef struct {
     uint32_t op;
     uint32_t len;
-    uint8_t *body;          /* '\0'-terminated, the caller frees it with sock_reply_free */
+    uint8_t *body;          /* NUL-terminated; the caller releases it with sock_reply_free */
+    int      fds[SOCK_MAX_FDS];  /* fds received with this reply; -1 means the slot is empty */
+    int      nfds;
 } sock_reply;
 
-/* Return value: 0 on success; -1 on communication/system error */
+/* Returns 0 on success, -1 on a communication/system error. */
 int  sock_connect(sock_client *c, const char *path);
 
-/* Send a request and wait for the reply. Returns 0 on success; 1 if the server returned an error packet (out->body is the error text); -1 on communication error */
+/* Sends a request and waits for the reply.
+ * Returns 0 on success, 1 if the server answered with an error packet
+ * (out->body holds the error text), -1 on a communication error. */
 int  sock_call(sock_client *c, uint32_t op, const void *body, uint32_t len, sock_reply *out);
 
+/* Detaches fds[i] from the reply so sock_reply_free will not close it.
+ * Returns the fd, or -1 if the index is out of range or already taken. */
+int  sock_reply_take_fd(sock_reply *r, int i);
+
+/* Frees the body and closes every fd still held by the reply. */
 void sock_reply_free(sock_reply *r);
+
 void sock_close(sock_client *c);
 #endif /* SOCK_CLIENT_H */

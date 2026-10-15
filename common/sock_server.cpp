@@ -13,6 +13,78 @@
 #include <stdexcept>
 #include <utility>
 
+namespace {
+
+// Sends fds over SCM_RIGHTS attached to the given bytes. On a stream socket the
+// fds must ride along with at least one data byte, so this is only ever used for
+// the first send of a packet; the rest of the packet goes out with plain send().
+ssize_t sendWithFds(int fd, const void* data, size_t len, const std::vector<int>& fds) {
+    struct msghdr msg = {};
+    struct iovec iov = {};
+    char cbuf[CMSG_SPACE(sizeof(int) * kMaxFds)] = {};
+    struct cmsghdr* cm;
+    size_t nfds = fds.size() > static_cast<size_t>(kMaxFds)
+                      ? static_cast<size_t>(kMaxFds) : fds.size();
+    ssize_t w;
+
+    iov.iov_base = const_cast<void*>(data);
+    iov.iov_len = len;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = CMSG_SPACE(sizeof(int) * nfds);
+
+    cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int) * nfds);
+    memcpy(CMSG_DATA(cm), fds.data(), sizeof(int) * nfds);
+
+    do {
+        w = sendmsg(fd, &msg, MSG_NOSIGNAL);
+    } while (w < 0 && errno == EINTR);
+    return w;
+}
+
+// Receives bytes and collects any fds that came with them.
+ssize_t recvWithFds(int fd, void* data, size_t len, std::vector<int>& out_fds) {
+    struct msghdr msg = {};
+    struct iovec iov = {};
+    char cbuf[CMSG_SPACE(sizeof(int) * kMaxFds)];
+    ssize_t r;
+
+    iov.iov_base = data;
+    iov.iov_len = len;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof cbuf;
+
+#ifdef MSG_CMSG_CLOEXEC
+    r = recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
+#else
+    r = recvmsg(fd, &msg, 0);
+#endif
+    if (r <= 0) return r;
+
+    for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm != nullptr; cm = CMSG_NXTHDR(&msg, cm)) {
+        if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) continue;
+        if (cm->cmsg_len < CMSG_LEN(0)) continue;
+        size_t n = (cm->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        const int* received = reinterpret_cast<const int*>(CMSG_DATA(cm));
+        for (size_t i = 0; i < n; ++i) {
+            if (out_fds.size() < static_cast<size_t>(kMaxFds)) {
+                out_fds.push_back(received[i]);
+            } else {
+                close(received[i]);  // no room: close rather than leak
+            }
+        }
+    }
+    return r;
+}
+
+}  // namespace
+
 void put32(std::vector<uint8_t>& v, uint32_t x) {
     uint32_t n = htonl(x);
     const uint8_t* p = reinterpret_cast<const uint8_t*>(&n);
@@ -96,7 +168,7 @@ void SockServer::run() {
     static constexpr size_t kMaxClients = 64;
 
     std::vector<pollfd> fds{{listen_fd_, POLLIN, 0}};
-    std::map<int, std::vector<uint8_t>> bufs;  // receive buffer per connection (handles coalesced/split packets)
+    std::map<int, Conn> conns;
 
     while (running_) {
         int n = poll(fds.data(), fds.size(), 500);
@@ -124,50 +196,79 @@ void SockServer::run() {
                     close(c);
                 } else {
                     fds.push_back({c, POLLIN, 0});
-                    bufs[c];
+                    conns[c];
                 }
                 continue;
             }
+
             uint8_t tmp[4096];
-            ssize_t r = recv(fd, tmp, sizeof(tmp), 0);
-            if (r <= 0) { if (r < 0 && errno == EINTR) continue; to_close.push_back(fd); continue; }
-            auto& b = bufs[fd];
-            b.insert(b.end(), tmp, tmp + r);
-            if (!drain(fd, b)) to_close.push_back(fd);
+            std::vector<int> got;
+            ssize_t r = recvWithFds(fd, tmp, sizeof tmp, got);
+            if (r <= 0) {
+                if (r < 0 && errno == EINTR) { closeFds(got); continue; }
+                closeFds(got);
+                to_close.push_back(fd);
+                continue;
+            }
+            Conn& c = conns[fd];
+            // Fds are attached to the first byte of the message, which starts at
+            // this offset in the connection's byte stream.
+            if (!got.empty()) c.fds[c.consumed + c.buf.size()] = std::move(got);
+            c.buf.insert(c.buf.end(), tmp, tmp + r);
+            if (!drain(fd, c)) to_close.push_back(fd);
         }
+
         for (int fd : to_close) {
             close(fd);
-            bufs.erase(fd);
+            auto it = conns.find(fd);
+            if (it != conns.end()) {
+                for (auto& kv : it->second.fds) closeFds(kv.second);
+                conns.erase(it);
+            }
             for (size_t i = 0; i < fds.size(); ++i)
                 if (fds[i].fd == fd) { fds.erase(fds.begin() + i); break; }
         }
     }
+
     for (size_t i = 1; i < fds.size(); ++i) close(fds[i].fd);
+    for (auto& kv : conns)
+        for (auto& pending : kv.second.fds) closeFds(pending.second);
 }
 
-void SockServer::stop() { running_ = false; }
+void SockServer::stop() { running_ = 0; }
 
-bool SockServer::drain(int fd, std::vector<uint8_t>& b) {
-    while (b.size() >= 4) {
-        uint32_t total = get32(b.data());
+bool SockServer::drain(int fd, Conn& c) {
+    while (c.buf.size() >= 4) {
+        uint32_t total = get32(c.buf.data());
         // Use the length field for a basic check first, to avoid waiting for a packet that will never become complete
         if (total < kHeaderLen || total > kMaxPacketLen) {
             sendError(fd, "invalid packet length");
             return false;
         }
-        if (b.size() < total) break;  // partial packet, keep waiting
+        if (c.buf.size() < total) break;  // partial packet, keep waiting
 
         Packet p;
         p.length = total;
-        p.header_len = get16(&b[4]);
-        p.version = get16(&b[6]);
-        p.op = get32(&b[8]);
-        p.reserved = get32(&b[12]);
+        p.header_len = get16(&c.buf[4]);
+        p.version = get16(&c.buf[6]);
+        p.op = get32(&c.buf[8]);
+        p.reserved = get32(&c.buf[12]);
         const char* err = validate(p);
         if (err) { sendError(fd, err); return false; }
-        p.body.assign(b.begin() + p.header_len, b.begin() + total);
-        b.erase(b.begin(), b.begin() + total);
+        p.body.assign(c.buf.begin() + p.header_len, c.buf.begin() + total);
+
+        // Pick up the fds that were attached to this packet's first byte, if any.
+        auto it = c.fds.find(c.consumed);
+        if (it != c.fds.end()) {
+            p.fds = std::move(it->second);
+            c.fds.erase(it);
+        }
+
+        c.buf.erase(c.buf.begin(), c.buf.begin() + total);
+        c.consumed += total;
+
         dispatch(fd, p);
+        closeFds(p.fds);  // the handler owns what it dups; the rest is ours to close
     }
     return true;
 }
@@ -181,22 +282,37 @@ const char* SockServer::validate(const Packet& p) {
 void SockServer::dispatch(int fd, const Packet& req) {
     auto it = handlers_.find(req.op);
     if (it == handlers_.end()) { sendError(fd, "unknown operation"); return; }
-    std::vector<uint8_t> reply;
-    if (!it->second(req, reply)) { sendError(fd, "handler failed"); return; }
-    sendAll(fd, encode(req.op, reply));
+
+    Reply reply;
+    if (!it->second(req, reply)) {
+        sendError(fd, "handler failed");
+        closeFds(reply.fds);
+        return;
+    }
+    sendAll(fd, encode(req.op, reply.body), reply.fds);
+    // The kernel has taken its own reference of every fd it accepted, so ours can go.
+    closeFds(reply.fds);
 }
 
 void SockServer::sendError(int fd, const char* msg) {
-    sendAll(fd, encode(kOpError, std::vector<uint8_t>(msg, msg + strlen(msg))));
+    sendAll(fd, encode(kOpError, std::vector<uint8_t>(msg, msg + strlen(msg))), {});
 }
 
-void SockServer::sendAll(int fd, const std::vector<uint8_t>& d) {
+void SockServer::sendAll(int fd, const std::vector<uint8_t>& d, const std::vector<int>& fds) {
     size_t off = 0;
     while (off < d.size()) {
-        ssize_t w = send(fd, d.data() + off, d.size() - off, MSG_NOSIGNAL);
+        ssize_t w = (off == 0 && !fds.empty())
+                        ? sendWithFds(fd, d.data(), d.size(), fds)
+                        : send(fd, d.data() + off, d.size() - off, MSG_NOSIGNAL);
         if (w < 0) { if (errno == EINTR) continue; return; }
         // w == 0 should not happen on a stream socket; bail out rather than spin forever.
         if (w == 0) return;
         off += static_cast<size_t>(w);
     }
+}
+
+void SockServer::closeFds(std::vector<int>& fds) {
+    for (int fd : fds)
+        if (fd >= 0) close(fd);
+    fds.clear();
 }
