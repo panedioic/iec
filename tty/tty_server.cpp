@@ -72,6 +72,7 @@ struct Pty {
     bool term_eof = false;
     bool app_eof = false;
     pid_t fg_pgrp = 0;   // foreground process group of this pty, for signals
+    pid_t fg_sid = 0;    // session that group belongs to, as reported by the client
     termios tio {};
     winsize ws {};
     std::vector<uint8_t> line;     // canonical input not yet released
@@ -174,17 +175,22 @@ bool drainQueue(int fd, std::vector<uint8_t>& q) {
 // session of its own is the other, and it is the one that matters in practice:
 // login_tty() calls setsid() before the program execs, so a shell's foreground
 // group is its own session and never the server's.
-bool trustedFgPgrp(pid_t pgrp) {
-    pid_t sid;
+bool trustedFgPgrp(pid_t pgrp, pid_t sid) {
     if (pgrp <= 0) return false;
     if (pgrp == getpgrp() || pgrp == getpid()) return false;  // never signal ourselves
-    sid = getsid(pgrp);
-    if (sid < 0) return false;                                // no such group any more
-    return sid == getsid(0) || sid == pgrp;
+    if (getsid(pgrp) < 0) return false;                       // no such group any more
+    /* Only groups in the session the client told us about.
+     *
+     * Two looser rules both fail here. "sid == getsid(0)" rejects everything,
+     * because login_tty's setsid() gives the pty a session of its own, never the
+     * server's. "sid == pgrp" accepts only a session leader, and a shell gives
+     * each job its own group with setpgid -- that job is not a session leader,
+     * so every Ctrl-C aimed at a running job would be dropped. */
+    return sid > 0 && getsid(pgrp) == sid;
 }
 
 void signalFg(Pty& e, int sig) {
-    if (trustedFgPgrp(e.fg_pgrp)) kill(-e.fg_pgrp, sig);
+    if (trustedFgPgrp(e.fg_pgrp, e.fg_sid)) kill(-e.fg_pgrp, sig);
 }
 
 // ------------------------------------------------------------------
@@ -477,10 +483,16 @@ bool TtyServer::onTcgetpgrp(const Packet& req, Reply& reply) {
 }
 
 bool TtyServer::onTcsetpgrp(const Packet& req, Reply& reply) {
-    Pty* e = ptyOfRequest(req, 8);
+    // 8 bytes is the pre-session layout, where the client only sent the group;
+    // 12 adds the session. ptyOfRequest insists on an exact length, so pass the
+    // length we actually received and validate the layout here.
+    if (req.body.size() < 8) return false;
+    Pty* e = ptyOfRequest(req, req.body.size());
     if (!e) return false;
 
     e->fg_pgrp = static_cast<pid_t>(get32(req.body.data() + 4));
+    e->fg_sid = req.body.size() >= 12
+                    ? static_cast<pid_t>(get32(req.body.data() + 8)) : 0;
     return true;
 }
 

@@ -313,9 +313,14 @@ static pid_t pts_tcgetpgrp(int pts_n) {
 }
 
 static int pts_tcsetpgrp(int pts_n, pid_t pgrp) {
-    uint8_t req[8];
+    uint8_t req[12];
     req_pts(req, pts_n);
     body_put32(req + 4, (uint32_t)pgrp);
+    /* Also report the session this group lives in. A shell gives each job its
+     * own process group with setpgid, but the job stays in the shell's session,
+     * so the group is not a session leader and the server has no other way to
+     * tell a legitimate job group from a stale number. */
+    body_put32(req + 8, (uint32_t)getsid(0));
     return rpc_call(OP_TCSETPGRP, req, sizeof req, NULL, 0, NULL);
 }
 
