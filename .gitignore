@@ -2,7 +2,7 @@
 # Intermediate objects, plus the generated protocols/ and config.h written by
 # scripts/build_client.sh
 /build/
-# Final artifacts: shim_tty.so, weston-terminal-wrap, tty_server
+# Final artifacts: libiec.so, weston-terminal-wrap, tty_server
 /dist/
 
 # ---- Prebuilt client binary ----
