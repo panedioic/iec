@@ -19,10 +19,16 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+/* The environment of this process. <unistd.h> declares it only under
+ * _GNU_SOURCE, which the build sets; spelled out here so that the inheritance
+ * below does not rest on a build flag. */
+extern char **environ;
 
 /* The exec service listens on its own socket, not the tty service's: a client
  * reaches a service by connecting to it, so the two paths must differ. */
@@ -273,6 +279,39 @@ __attribute__((noreturn)) static void become_stand_in(uint32_t remote_pid) {
     _exit(EXEC_STATUS_LOST);
 }
 
+static const char *const g_kept[] = { "LD_PRELOAD", "PATH" };
+#define KEPT_COUNT ((int)(sizeof g_kept / sizeof g_kept[0]))
+
+/* Whether the environment names the variable. The '=' is part of the match, so
+ * that "PATH=" counts as stated -- an empty value is a statement about the
+ * program's search path, not an omission -- while "PATHOLOGY=1" does not. */
+static int env_states(char *const env[], const char *name) {
+    size_t n = strlen(name);
+    size_t i;
+
+    for (i = 0; env && env[i]; i++)
+        if (strncmp(env[i], name, n) == 0 && env[i][n] == '=') return 1;
+    return 0;
+}
+
+/* Which entries of g_kept this request has to put back, one bit per entry.
+ *
+ * A mask rather than a count, because the two places that need the answer are far
+ * apart in exec_common(): the header is written before the strings and carries
+ * their number, the strings themselves are written afterwards. Deciding once here
+ * is what keeps the number and the entries from being able to disagree.
+ *
+ * An entry this process does not have is not a candidate: there is nothing to put
+ * back. */
+static unsigned kept_mask(char *const env[]) {
+    unsigned mask = 0;
+    int i;
+
+    for (i = 0; i < KEPT_COUNT; i++)
+        if (!env_states(env, g_kept[i]) && getenv(g_kept[i])) mask |= 1u << i;
+    return mask;
+}
+
 static int exec_common(enum CallMethod method, const char *file,
                        char *const argv[], char *const envp[]) {
     /* Compact request for OP_EXECUTE. Everything is length-delimited by the
@@ -282,7 +321,9 @@ static int exec_common(enum CallMethod method, const char *file,
      *   [0..3]   flags       bit0 = the caller waits for the child.
      *   [4..7]   call_method 
      *   [8..11]  argc
-     *   [12..15] envc
+     *   [12..15] envc        entries in the env list below: the environment the
+     *                        program is to start with, plus the variables put
+     *                        back by kept_mask()
      *   [16..19] fd_count
      *   fd_count x [4 bytes target_fd]
      *   then NUL-terminated strings, in this order:
@@ -296,7 +337,16 @@ static int exec_common(enum CallMethod method, const char *file,
      * entirely, and then counting along the received fds would map stderr onto
      * stdout.
      */
-    enum { EXEC_REQ_MAX = 8192, EXEC_FLAG_WAIT = 1, EXEC_FLAG_STDIO = 2, EXEC_STDIO_FDS = 3,
+    /* The request has to hold the whole environment, which is why this is far more
+     * than the rest of the request needs: an interactive environment is a few
+     * kilobytes -- PATH alone is over a thousand bytes of the one this was written
+     * against -- and a request that does not fit fails the exec outright, so the
+     * cost of a size that is too small is no shell at all for a command that works
+     * everywhere else. 32 KiB is several times the largest environment seen on the
+     * target and small enough to sit on the stack of a thread that is not the main
+     * one. Overrunning it stays a defined failure: see the too_long arm below,
+     * which reports it and fails the call with E2BIG. */
+    enum { EXEC_REQ_MAX = 32768, EXEC_FLAG_WAIT = 1, EXEC_FLAG_STDIO = 2, EXEC_STDIO_FDS = 3,
            EXEC_PID_REPLY = 4, EXEC_FAIL_REPLY = 8 };
     uint8_t req[EXEC_REQ_MAX];
     uint8_t answer[EXEC_FAIL_REPLY];      /* the larger of the two OP_EXECUTE answers */
@@ -305,13 +355,29 @@ static int exec_common(enum CallMethod method, const char *file,
     uint32_t targets[EXEC_STDIO_FDS];
     int nfds = 0, fd;
     size_t off, argc = 0, envc = 0, i, len;
+    char *const *env;                     /* the environment the request carries */
+    unsigned kept;                        /* one bit per g_kept entry to put back */
+    size_t kept_n = 0;                    /* how many entries that comes to */
+
+    /* What the program is to start with: the environment the call states, or this
+     * process's own when it states none -- both the four with no environment
+     * argument and the NULL an 'e' call may pass land on the second arm; see the
+     * section above for why each arm is what it is. */
+    env = envp ? envp : (char *const *)environ;
 
     if (!file) {
         errno = ENOENT;
         return -1;
     }
     while (argv && argv[argc]) argc++;
-    while (envp && envp[envc]) envc++;
+    while (env && env[envc]) envc++;
+
+    /* Which variables that environment has to be given, decided here because the
+     * header below carries the count of them; the entries themselves are appended
+     * further down. Zero when it already names every entry of g_kept, so an
+     * ordinary request goes out exactly as it did before. */
+    kept = kept_mask(env);
+    for (i = 0; i < (size_t)KEPT_COUNT; i++) kept_n += (kept >> i) & 1u;
 
     /* The child is started on the server, so our own stdio -- the terminal this
      * exec was called from -- has to travel with the request; without it the
@@ -330,7 +396,7 @@ static int exec_common(enum CallMethod method, const char *file,
     body_put32(req, EXEC_FLAG_WAIT | (nfds > 0 ? EXEC_FLAG_STDIO : 0u));
     body_put32(req + 4, (uint32_t)method);
     body_put32(req + 8, (uint32_t)argc);
-    body_put32(req + 12, (uint32_t)envc);
+    body_put32(req + 12, (uint32_t)(envc + kept_n));
     body_put32(req + 16, (uint32_t)nfds);
     for (i = 0; i < (size_t)nfds; i++) body_put32(req + 20 + 4 * i, targets[i]);
 
@@ -342,10 +408,29 @@ static int exec_common(enum CallMethod method, const char *file,
         off += len;                                     \
     } while (0)
 
+/* The same bounds check and the same buffer, for the one string here that is
+ * built rather than copied whole: "NAME=VALUE". */
+#define PUT_KEPT(name, value)                            \
+    do {                                                 \
+        size_t n = strlen(name);                         \
+        len = n + 1 + strlen(value) + 1;                 \
+        if (off + len > EXEC_REQ_MAX) goto too_long;     \
+        memcpy(req + off, (name), n);                    \
+        req[off + n] = '=';                              \
+        memcpy(req + off + n + 1, (value), len - n - 1); \
+        off += len;                                      \
+    } while (0)
+
     PUT_CSTR(file);
     PUT_CSTR("");                          /* cwd: inherit */
     for (i = 0; i < argc; i++) PUT_CSTR(argv[i]);
-    for (i = 0; i < envc; i++) PUT_CSTR(envp[i]);
+    for (i = 0; i < envc; i++) PUT_CSTR(env[i]);
+    /* Last, so the caller's own order is what the program reads first. The mask is
+     * what says which of them; getenv() cannot answer NULL for one it names, since
+     * kept_mask() only sets a bit for a variable this process was given. */
+    for (i = 0; i < (size_t)KEPT_COUNT; i++)
+        if ((kept >> i) & 1u) PUT_KEPT(g_kept[i], getenv(g_kept[i]));
+#undef PUT_KEPT
 #undef PUT_CSTR
 
     /* The reply is the pid the server started the program under, or nothing at
