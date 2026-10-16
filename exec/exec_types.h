@@ -15,7 +15,7 @@
 #include "sock_operation.h"
 
 // How a program is started. ResolveKind() in exec_server.cpp picks one from the host
-// capabilities probed there; the switch in Spawn() is what carries it out.
+// capabilities probed there; StartByKind() in the same file is what carries it out.
 enum class LaunchKind {
     kAuto,          // nobody has decided yet
     kExec,          // plain fork + execve
@@ -23,6 +23,7 @@ enum class LaunchKind {
     kLoader,        // a loader is executed in the program's place
     kQemu_x86_64,   // emulated, qemu in the program's place
     kQemu_aarch64,
+    kShebang,
     kUnexecutable,  // no way to run this path
 };
 

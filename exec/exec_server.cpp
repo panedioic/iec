@@ -24,6 +24,8 @@
 #include "constant.h"
 #include "elf.h"
 #include "exec_qemu.h"
+#include "exec_route.h"
+#include "exec_shebang.h"
 #include "exec_so.h"
 #include "exec_types.h"
 
@@ -117,7 +119,7 @@ static std::string PathForRequest(const std::vector<std::string>& env) {
 // is left alone, being relative to a working directory, and the empty string stays empty,
 // which is what keeps the "an empty PATH entry means the working directory" rule below
 // working.
-static std::string UnderFakeRoot(const std::string& path) {
+std::string UnderFakeRoot(const std::string& path) {
     if (g_caps.path != 0) return path;
     if (path.empty() || path[0] != '/') return path;
     return std::string(FAKE_SYSROOT) + path;
@@ -148,6 +150,7 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
 }
 
 LaunchKind ResolveKind(const std::string& path) {
+    if (g_caps.fork == 1 && ReadShebang(path))  return LaunchKind::kShebang;
     if (g_caps.fork == 1 && IsSoLauncher(path)) return LaunchKind::kSo;
 
     const uint16_t machine = ElfMachine(path);
@@ -391,6 +394,48 @@ void ClearInheritedSignalMask() {
     sigprocmask(SIG_SETMASK, &empty, nullptr);
 }
 
+[[noreturn]] void StartByKind(LaunchKind kind, const SpawnRequest& req) {
+    switch (kind) {
+        case LaunchKind::kExec:
+            SpawnExec(req);   /* returns when execve failed */
+            {
+                static const char msg[] = "[exec] exec failed\n";
+                if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+            }
+            _exit(kExecFailedExit);
+        case LaunchKind::kSo:
+            SpawnSo(req);
+            {
+                static const char msg[] = "[exec] so failed\n";
+                if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+            }
+            _exit(kExecFailedExit);
+        case LaunchKind::kQemu_x86_64:
+        case LaunchKind::kQemu_aarch64:
+            SpawnQemu(req);
+            {
+                static const char msg[] = "[exec] qemu failed\n";
+                if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+            }
+            _exit(kExecFailedExit);
+        case LaunchKind::kShebang:
+            SpawnShebang(req);   /* returns for a script that cannot be followed */
+            {
+                static const char msg[] = "[exec] shebang failed\n";
+                if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+            }
+            _exit(kExecFailedExit);
+        default:
+            // kAuto is settled before this is reached, and kLoader and kUnexecutable have
+            // no router yet.
+            {
+                static const char msg[] = "[exec] launch kind unsupported\n";
+                if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+            }
+            _exit(kExecFailedExit);
+    }
+}
+
 SpawnResult Spawn(const SpawnRequest& req) {
     SpawnResult res;
     if (req.path.empty()) { res.error = "path is empty"; return res; }
@@ -434,37 +479,9 @@ SpawnResult Spawn(const SpawnRequest& req) {
             if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
             _exit(kExecFailedExit);
         }
-        switch (res.kind) {
-            case LaunchKind::kExec:
-                SpawnExec(req);   /* returns only on failure */
-                {
-                    static const char msg[] = "[exec] exec failed\n";
-                    if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
-                }
-                _exit(kExecFailedExit);
-            case LaunchKind::kSo:
-                SpawnSo(req);   /* returns only on failure */
-                {
-                    static const char msg[] = "[exec] so failed\n";
-                    if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
-                }
-                _exit(kExecFailedExit);
-            case LaunchKind::kQemu_x86_64:
-            case LaunchKind::kQemu_aarch64:
-                SpawnQemu(req);   /* returns only on failure */
-                {
-                    static const char msg[] = "[exec] qemu failed\n";
-                    if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
-                }
-                _exit(kExecFailedExit);
-            default:
-                // kLoader and kUnexecutable have no router yet.
-                {
-                    static const char msg[] = "[exec] launch kind unsupported\n";
-                    if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
-                }
-                _exit(kExecFailedExit);
-        }
+        // In order to facilitate the reuse of logic in SpawnShebang, the routing 
+        // for the "kind" will be extracted separately as a function here.
+        StartByKind(res.kind, req);
     }
     // parent
     ProcessInfo info;

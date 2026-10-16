@@ -48,14 +48,31 @@ for name in sh bash; do
 		|| err "building the fake $name failed (a static link needs this host's static libstdc++)"
 done
 
-log "artifacts: $BINDIR/sh $BINDIR/bash"
+# One script to go with it, which is what the interpreter route is for: inside the root
+# /bin/sh is the fake shell above, so running this prints its banner and echoes what is
+# typed. The -e after the interpreter is there on purpose, being the single argument a
+# shebang line may carry between the interpreter and the script.
+SAMPLE="$BINDIR/hello.sh"
+log "writing $SAMPLE"
+cat > "$SAMPLE" <<'EOF'
+#!/bin/sh -e
+echo "this line comes from the script, read by whatever /bin/sh is"
+EOF
+chmod +x "$SAMPLE"
+
+log "artifacts: $BINDIR/sh $BINDIR/bash $SAMPLE"
 cat >&2 <<EOF
 
 To land in it: with the server running, start a terminal -- or any pty client -- with
   SHELL=$BINDIR/sh
-What comes up prints "Hello, this is not real sh!" and echoes every line back.
+What comes up prints "Hello, this is not real sh!" and echoes every line back, and it also
+prints the arguments it was started with, being the only place a script's own name shows
+up once its interpreter line has been followed -- the shell itself never reads the script.
 
 The other way in is the fake root itself: with the capabilities saying the app sandbox is
-all there is (PATH_PROBE = 0), an absolute path is rewritten into $FAKE_SYSROOT, and
-/bin/sh means the file built above.
+all there is (PATH_PROBE = 0), an absolute path is rewritten into $FAKE_SYSROOT, so
+/bin/sh and /bin/hello.sh mean the two files built here. Starting the second one is what
+the interpreter route is for: /bin/sh is read out of the script's first line, the script's
+own name follows it as the argument to run, and that is why the block above shows
+$FAKE_SYSROOT/bin/sh and then $FAKE_SYSROOT/bin/hello.sh.
 EOF
