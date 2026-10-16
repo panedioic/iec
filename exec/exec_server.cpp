@@ -21,37 +21,8 @@
 #include <thread>
 #include <unordered_map>
 
-// How a program is started. Which one applies is decided by ResolveKind() from
-// the host capabilities below.
-enum class LaunchKind {
-    kAuto,          // nobody has decided yet
-    kExec,          // plain fork + execve
-    kSo,            // a shared object, entered through the loader
-    kLoader,        // a loader is executed in the program's place
-    kQemu_x86_64,   // emulated, qemu in the program's place
-    kQemu_aarch64,
-    kUnexecutable,  // no way to run this path
-};
-
-struct InheritedFd { 
-    int source_fd; 
-    int target_fd; 
-};
-
-struct SpawnRequest {
-    std::string path;                       // The path of the executable file
-    std::vector<std::string> argv;          // argv[0] is the command name
-    std::vector<std::string> env;           // "K=V"
-    std::string cwd;                        // empty is inherit
-    LaunchKind kind_hint = LaunchKind::kAuto;   // kAuto = the caller did not decide
-    std::vector<InheritedFd> stdio_fds;     // target ∈ {0,1,2}
-    std::vector<InheritedFd> extra_fds;     // target > 2; no request fills this yet
-    int         sid = 0;
-    bool        sync_wait = true;           // A foreground terminal command always waits.
-    std::string proc_name;                  // prctl(PR_SET_NAME)
-    CallMethod  call_method = CALL_METHOD_END;
-    pid_t       caller_pid = 0;
-};
+#include "exec_so.h"
+#include "exec_types.h"
 
 struct SpawnResult {
     pid_t      pid = -1;
@@ -164,10 +135,15 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
     return std::string();
 }
 
-LaunchKind ResolveKind(std::string path) {
-    // todo: implement future.
-    if (g_caps.fork == 1 && g_caps.exec == 2)
-        return LaunchKind::kExec;
+LaunchKind ResolveKind(const std::string& path) {
+    // A launcher is a file that says so on its first line, and it is checked before
+    // exec because the case this route exists for is the one where execve is not how
+    // programs are started. A file that claims to be a launcher and then fails to
+    // parse is left to Spawn(), which can tell the client what was wrong with it.
+    if (g_caps.fork == 1) {
+        if (IsSoLauncher(path)) return LaunchKind::kSo;
+        if (g_caps.exec == 2) return LaunchKind::kExec;
+    }
     return LaunchKind::kUnexecutable;
 }
 
@@ -450,8 +426,15 @@ SpawnResult Spawn(const SpawnRequest& req) {
                     if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
                 }
                 _exit(kExecFailedExit);
+            case LaunchKind::kSo:
+                SpawnSo(req);   /* returns only on failure */
+                {
+                    static const char msg[] = "[exec] so failed\n";
+                    if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+                }
+                _exit(kExecFailedExit);
             default:
-                // kSo, kLoader, kQemu_* and kUnexecutable have no router yet.
+                // kLoader, kQemu_* and kUnexecutable have no router yet.
                 {
                     static const char msg[] = "[exec] launch kind unsupported\n";
                     if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}

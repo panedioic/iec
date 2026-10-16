@@ -45,9 +45,10 @@ SHIM_WRAPS := open close dup dup2 dup3 fcntl ioctl isatty ttyname \
 WRAP_FLAGS := $(foreach s,$(SHIM_WRAPS),-Wl,--wrap=$(s))
 
 SERVER_BIN  := $(DIST)/iec_server
-SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp common/sock_server.cpp
-SERVER_HDR  := tty/tty_server.h exec/exec_server.h common/sock_server.h \
-               common/sock_operation.h
+SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp exec/exec_so.cpp \
+               common/sock_server.cpp
+SERVER_HDR  := tty/tty_server.h exec/exec_server.h exec/exec_so.h exec/exec_types.h \
+               common/sock_server.h common/sock_operation.h
 
 ifeq ($(MODE),warp)
   TARGET := $(DIST)/weston-terminal-wrap
@@ -70,7 +71,7 @@ $(DIST) $(BUILD):
 server: $(SERVER_BIN)
 
 $(SERVER_BIN): $(SERVER_SRCS) $(SERVER_HDR) | $(DIST)
-	$(CXX) $(CXXFLAGS) -pthread $(SERVER_SRCS) -o $@
+	$(CXX) $(CXXFLAGS) -pthread $(SERVER_SRCS) -o $@ -ldl
 
 run-server: $(SERVER_BIN)
 	./$(SERVER_BIN)
