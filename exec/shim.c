@@ -297,9 +297,9 @@ static int exec_common(enum CallMethod method, const char *file,
      * stdout.
      */
     enum { EXEC_REQ_MAX = 8192, EXEC_FLAG_WAIT = 1, EXEC_FLAG_STDIO = 2, EXEC_STDIO_FDS = 3,
-           EXEC_PID_REPLY = 4 };
+           EXEC_PID_REPLY = 4, EXEC_FAIL_REPLY = 8 };
     uint8_t req[EXEC_REQ_MAX];
-    uint8_t answer[EXEC_PID_REPLY];       /* the pid OP_EXECUTE answers with */
+    uint8_t answer[EXEC_FAIL_REPLY];      /* the larger of the two OP_EXECUTE answers */
     uint32_t answer_len;
     int send_fds[EXEC_STDIO_FDS];
     uint32_t targets[EXEC_STDIO_FDS];
@@ -350,11 +350,25 @@ static int exec_common(enum CallMethod method, const char *file,
 
     /* The reply is the pid the server started the program under, or nothing at
      * all when nothing was started. Only a failure to start is answered with -1,
-     * because that is the only case in which the caller's exec really failed. */
+     * because that is the only case in which the caller's exec really failed.
+     *
+     * A refusal the server can name -- today, only a PATH search that matched
+     * nothing -- is answered with the longer shape: no pid, then the errno the
+     * caller's exec should fail with. That is how a missing program reaches the
+     * caller as ENOENT, the errno POSIX gives for it, instead of the transport
+     * error a bare "the request failed" would leave behind. */
     answer_len = 0;
     if (rpc_call_fds(OP_EXECUTE, req, (uint32_t)off, send_fds, nfds,
                      answer, sizeof answer, &answer_len) < 0)
         return -1;                     /* errno is already set by the rpc layer */
+
+    if (answer_len >= EXEC_FAIL_REPLY) {
+        errno = (int)iec_get32(answer + 4);
+        /* 0 would mean the server refused without saying why, which is not a
+         * state it produces; a defined failure still beats an undefined errno. */
+        if (errno == 0) errno = EIO;
+        return -1;
+    }
 
     if (answer_len < EXEC_PID_REPLY) {
         /* No pid means there is no process to stand in for. The server only leaves

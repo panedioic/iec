@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -118,9 +119,47 @@ static std::unordered_map<pid_t, ProcessInfo> procmap;
 /* Resolver                                                           */
 /* ------------------------------------------------------------------ */
 
-std::string ResolveFilePath(std::string path) {
-    // todo: implement future.
-    return path;
+static bool IsExecutableFile(const std::string& path) {
+    struct stat st;
+
+    if (stat(path.c_str(), &st) != 0) return false;
+    if (!S_ISREG(st.st_mode)) return false;
+    return access(path.c_str(), X_OK) == 0;
+}
+
+static std::string PathForRequest(const std::vector<std::string>& env) {
+    for (const std::string& e : env)
+        if (e.compare(0, 5, "PATH=") == 0) return e.substr(5);
+
+    if (const char* own = getenv("PATH")) return own;
+    
+    std::string fallback;
+    size_t n = confstr(_CS_PATH, nullptr, 0);
+    if (n > 0) {
+        fallback.resize(n);
+        confstr(_CS_PATH, &fallback[0], n);
+        if (fallback.back() == '\0') fallback.pop_back();
+    }
+    return fallback;
+}
+
+std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env) {
+    if (path.find('/') != std::string::npos) return path;
+
+    const std::string dirs = PathForRequest(env);
+    size_t start = 0;
+
+    for (;;) {
+        const size_t colon = dirs.find(':', start);
+        const size_t end = colon == std::string::npos ? dirs.size() : colon;
+        const std::string dir = dirs.substr(start, end - start);
+        const std::string candidate = dir.empty() ? path : dir + "/" + path;
+
+        if (IsExecutableFile(candidate)) return candidate;
+        if (colon == std::string::npos) break;
+        start = colon + 1;
+    }
+    return std::string();
 }
 
 LaunchKind ResolveKind(std::string path) {
@@ -128,6 +167,18 @@ LaunchKind ResolveKind(std::string path) {
     if (g_caps.fork == 1 && g_caps.exec == 2)
         return LaunchKind::kExec;
     return LaunchKind::kUnexecutable;
+}
+
+static bool SearchesPath(CallMethod method) {
+    switch (method) {
+        case CALL_EXECVP:
+        case CALL_EXECVPE:
+        case CALL_EXECLP:
+            return true;
+        default:
+            break;
+    }
+    return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -617,9 +668,7 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     std::string file, cwd;
     if (!next("file", file)) return false;
     if (!next("cwd", cwd)) return false;
-    sr.path = ResolveFilePath(file);
     sr.cwd = cwd;
-    sr.kind_hint = ResolveKind(sr.path);
     sr.sid = 0; // todo: multisession in future.
     // The remaining fields keep their defaults: sync_wait is true (a foreground
     // command on a terminal always waits), and no process name is carried by the
@@ -645,6 +694,22 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
         sr.env.push_back(e);
     }
     if (off != n) fprintf(stderr, "[exec] %zu trailing bytes ignored\n", n - off);
+
+    if (SearchesPath(sr.call_method)) {
+        sr.path = ResolveFilePath(file, sr.env);
+        if (sr.path.empty()) {
+            fprintf(stderr, "[exec] %s: no such file on PATH (method %d)\n",
+                    file.c_str(), (int)sr.call_method);
+            put32(reply.body, 0);                        // no pid: nothing was started
+            put32(reply.body, static_cast<uint32_t>(ENOENT));
+            return true;
+        }
+        if (sr.path != file)
+            fprintf(stderr, "[exec] %s resolved to %s\n", file.c_str(), sr.path.c_str());
+    } else {
+        sr.path = file;
+    }
+    sr.kind_hint = ResolveKind(sr.path);
 
     // A request turns into a real process whose stdio is the caller's: the fds
     // that came with the request are dup2'd onto the targets the request named, in
