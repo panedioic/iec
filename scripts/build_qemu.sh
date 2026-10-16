@@ -207,15 +207,23 @@ build_qemu_so() {
 		|| { tail -40 "$BUILD/so-make.log" >&2; err "build failed"; }
 
 	# qemu's linux-user main takes (argc, argv, envp) and a .so has no main, so it is
-	# renamed and wrapped. The entry IEC's side calls is the two-argument one.
-	local wrap_c="$BUILD/qemu_entry_wrapper.c"
-	cat > "$wrap_c" <<'EOF'
+	# renamed and wrapped. The entry the server calls is the two-argument one, and its
+	# name comes out of common/constant.h: the server dlsym()s that same name, so the two
+	# have to come from one place -- a mismatch would be silent until something was
+	# started with it.
+	local entry_name
+	entry_name=$(sed -n 's/^#define[[:space:]][[:space:]]*QEMU_ENTRY[[:space:]][[:space:]]*"\([^"]*\)".*/\1/p' \
+		"$ROOT/common/constant.h")
+	[ -n "$entry_name" ] || err "QEMU_ENTRY not found in common/constant.h"
+	local wrap_c="$BUILD/${entry_name}_wrapper.c"
+	cat > "$wrap_c" <<EOF
 /* The entry the server calls is int (*)(int, char **), which is what main looks like
  * without its third argument. linux-user does read the environment, so it is put back
- * here rather than left to chance. */
+ * here rather than left to chance. The name below is $entry_name, taken from
+ * common/constant.h by the script that generated this file. */
 extern char **environ;
 extern int qemu_main3(int argc, char **argv, char **envp);
-int qemu_entry(int argc, char **argv) {
+int $entry_name(int argc, char **argv) {
 	return qemu_main3(argc, argv, environ);
 }
 EOF
@@ -278,10 +286,10 @@ EOF
 	ls -l "$OUT"/*.so >&2
 	cat >&2 <<EOF
 
-Point the server at them with:
-  LD_LIBRARY_PATH=$OUT ./dist/iec_server
-and note that exec_qemu.cpp looks them up by bare SONAME (libqemu-<guest>.so), so the
-names here are what it has to ask for.
+The server loads these by the absolute paths written in common/constant.h, which point at
+this directory, so nothing has to be set in the environment to run it. A build for another
+machine overrides those paths (with -D on the server's compile line) rather than moving
+the files: the names here are the ones it asks for by name.
 EOF
 }
 

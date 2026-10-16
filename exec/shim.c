@@ -10,6 +10,7 @@
 // end and then leaves with the same status, which is what makes the caller's
 // waitpid() report what the real program did. See the end of exec_common().
 
+#include "constant.h"
 #include "intercept.h"
 #include "rpc.h"
 #include "sock_operation.h"
@@ -31,9 +32,9 @@
  * below does not rest on a build flag. */
 extern char **environ;
 
-/* The exec service listens on its own socket, not the tty service's: a client
- * reaches a service by connecting to it, so the two paths must differ. */
-#define EXEC_SOCK_PATH "/tmp/exec_service.sock"
+/* The exec service listens on its own socket, not the tty service's: a client reaches a
+ * service by connecting to it, so the two paths differ. The path itself is in
+ * constant.h, where the server reads the same one. */
 
 /* Exit status for the stand-in when the child's ending never reached it -- the
  * server died, or answered something that is not a status. 127 is the shell's

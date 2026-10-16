@@ -21,6 +21,7 @@
 //
 // Everything that is not pty-related falls through to the real libc function.
 
+#include "constant.h"
 #include "intercept.h"
 #include "rpc.h"
 #include "sock_operation.h"
@@ -40,10 +41,8 @@
 /* login_tty() is declared here, not in pty.h. */
 #include <utmp.h>
 
-#define TTY_SOCK_PATH "/tmp/tty_service.sock"
-#define PTMX_PATH     "/dev/ptmx"
-#define PTS_PREFIX    "/dev/pts/"
-#define PTS_PREFIX_LEN (sizeof PTS_PREFIX - 1)
+/* The paths this shim and the service have to agree on live in constant.h; SHIM_MAX_FD is
+ * this file's own business -- how many descriptors the table above can hold. */
 #define SHIM_MAX_FD   256
 
 #ifdef INT_WARP

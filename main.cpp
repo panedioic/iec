@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <exception>
 
+#include "common/constant.h"
 #include "exec/exec_server.h"
 #include "tty/tty_server.h"
 
@@ -22,8 +23,8 @@ static void onSignal(int) {
 int main(int argc, char** argv) {
     // One argument cannot name both services: each listens on its own socket, so
     // the tty path comes first and the exec path second.
-    const char* tty_path  = argc > 1 ? argv[1] : "/tmp/tty_service.sock";
-    const char* exec_path = argc > 2 ? argv[2] : "/tmp/exec_service.sock";
+    const char* tty_path  = argc > 1 ? argv[1] : TTY_SOCK_PATH;
+    const char* exec_path = argc > 2 ? argv[2] : EXEC_SOCK_PATH;
     try {
         TtyServer tty_srv(tty_path);
         ExecServer exec_srv(exec_path);

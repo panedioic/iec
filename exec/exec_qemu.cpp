@@ -2,6 +2,7 @@
 // hand it the program.
 #include "exec_qemu.h"
 
+#include "constant.h"
 #include "elf.h"
 
 #include <dlfcn.h>
@@ -20,20 +21,21 @@ constexpr int kQemuEntryMissingExit = 126;
 namespace {
 
 // One object per guest architecture, named for the guest rather than for the host that
-// runs it: libqemu-aarch64.so is the emulator that runs aarch64 programs, whichever host
-// it is loaded on. scripts/build_qemu.sh produces exactly these names.
+// runs it: the aarch64 object is the emulator that runs aarch64 programs, whichever host
+// it is loaded on. The paths, the names and the entry point are in constant.h, which is
+// also where the script that builds the objects takes them from.
 const char* ObjectFor(uint16_t machine) {
     switch (machine) {
-        case EM_AARCH64: return "libqemu-aarch64.so";
-        case EM_X86_64:  return "libqemu-x86_64.so";
+        case EM_AARCH64: return PATH_QEMU_AARCH64_SO;
+        case EM_X86_64:  return PATH_QEMU_X86_64_SO;
         default:         return nullptr;
     }
 }
 
 const char* NameFor(uint16_t machine) {
     switch (machine) {
-        case EM_AARCH64: return "qemu-aarch64";
-        case EM_X86_64:  return "qemu-x86_64";
+        case EM_AARCH64: return QEMU_NAME_AARCH64;
+        case EM_X86_64:  return QEMU_NAME_X86_64;
         default:         return nullptr;
     }
 }
@@ -98,7 +100,7 @@ pid_t SpawnQemu(const SpawnRequest& req) {
     if (!h) _exit(kQemuLoadFailedExit);
 
     using EntryFn = int (*)(int, char**);
-    auto entry = (EntryFn)dlsym(h, "qemu_entry");
+    auto entry = (EntryFn)dlsym(h, QEMU_ENTRY);
     if (!entry) _exit(kQemuEntryMissingExit);
 
     rc = entry(argc, argv.data());

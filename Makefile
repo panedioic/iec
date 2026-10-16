@@ -27,9 +27,9 @@ BUILD := build
 CFLAGS   += -Wall -Icommon -D_GNU_SOURCE
 CXXFLAGS += -Wall -Icommon -D_GNU_SOURCE
 SHIM_SRC := tty/shim.c
-SHIM_HDR := common/intercept.h common/rpc.h common/sock_operation.h
+SHIM_HDR := common/constant.h common/intercept.h common/rpc.h common/sock_operation.h
 EXEC_SRC := exec/shim.c
-EXEC_HDR := common/intercept.h common/rpc.h
+EXEC_HDR := common/constant.h common/intercept.h common/rpc.h
 SOCK_SRC := common/sock_client.c
 SOCK_HDR := common/sock_client.h
 RPC_SRC  := common/rpc.c
@@ -47,8 +47,9 @@ WRAP_FLAGS := $(foreach s,$(SHIM_WRAPS),-Wl,--wrap=$(s))
 SERVER_BIN  := $(DIST)/iec_server
 SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp exec/exec_so.cpp \
                exec/exec_qemu.cpp exec/elf.cpp common/sock_server.cpp
-SERVER_HDR  := tty/tty_server.h exec/exec_server.h exec/exec_so.h exec/exec_types.h \
-               exec/exec_qemu.h exec/elf.h common/sock_server.h common/sock_operation.h
+SERVER_HDR  := common/constant.h tty/tty_server.h exec/exec_server.h exec/exec_so.h \
+               exec/exec_types.h exec/exec_qemu.h exec/elf.h common/sock_server.h \
+               common/sock_operation.h
 
 ifeq ($(MODE),warp)
   TARGET := $(DIST)/weston-terminal-wrap
