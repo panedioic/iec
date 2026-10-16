@@ -2,7 +2,7 @@
 #
 #   make            build the shim (per MODE) + the server
 #   make run        run weston-terminal once with interception (server must already be running)
-#   make run-server run the tty server in the foreground
+#   make run-server run both servers in the foreground (each service on its own thread)
 #   make clean
 #
 # MODE=warp (default)  link-time interception: shim becomes build/shim_tty.o, relinked with the
@@ -10,8 +10,9 @@
 # MODE=preload       load-time interception: shim becomes dist/libiec.so, injected into the
 #                    stock ./weston-terminal via LD_PRELOAD
 #
-# Both modes must also include common/sock_client.c: the shim goes over UDS to find the server,
-# so these symbols must be compiled in (an LD_PRELOAD .so can't expect the host to provide them).
+# Both modes must also include common/sock_client.c and common/rpc.c: the shim goes over UDS to
+# find the server and does the round trip with helpers shared by the two shims, so these symbols
+# must be compiled in (an LD_PRELOAD .so can't expect the host to provide them).
 #
 # Typical usage (two terminals):
 #   $ make run-server
@@ -26,11 +27,13 @@ BUILD := build
 CFLAGS   += -Wall -Icommon -D_GNU_SOURCE
 CXXFLAGS += -Wall -Icommon
 SHIM_SRC := tty/shim.c
-SHIM_HDR := common/intercept.h common/sock_client.h common/sock_operation.h
+SHIM_HDR := common/intercept.h common/rpc.h common/sock_operation.h
 EXEC_SRC := exec/shim.c
-EXEC_HDR := common/intercept.h
+EXEC_HDR := common/intercept.h common/rpc.h
 SOCK_SRC := common/sock_client.c
 SOCK_HDR := common/sock_client.h
+RPC_SRC  := common/rpc.c
+RPC_HDR  := common/rpc.h
 
 # Every entry point the shims take over. MODE=warp needs a --wrap for each, so
 # that calls from the client are redirected to __wrap_<name>; MODE=preload
@@ -42,8 +45,9 @@ SHIM_WRAPS := open close dup dup2 dup3 fcntl ioctl isatty ttyname \
 WRAP_FLAGS := $(foreach s,$(SHIM_WRAPS),-Wl,--wrap=$(s))
 
 SERVER_BIN  := $(DIST)/tty_server
-SERVER_SRCS := main.cpp tty/tty_server.cpp common/sock_server.cpp
-SERVER_HDR  := tty/tty_server.h common/sock_server.h common/sock_operation.h
+SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp common/sock_server.cpp
+SERVER_HDR  := tty/tty_server.h exec/exec_server.h common/sock_server.h \
+               common/sock_operation.h
 
 ifeq ($(MODE),warp)
   TARGET := $(DIST)/weston-terminal-wrap
@@ -66,7 +70,7 @@ $(DIST) $(BUILD):
 server: $(SERVER_BIN)
 
 $(SERVER_BIN): $(SERVER_SRCS) $(SERVER_HDR) | $(DIST)
-	$(CXX) $(CXXFLAGS) $(SERVER_SRCS) -o $@
+	$(CXX) $(CXXFLAGS) -pthread $(SERVER_SRCS) -o $@
 
 run-server: $(SERVER_BIN)
 	./$(SERVER_BIN)
@@ -81,17 +85,20 @@ $(BUILD)/exec_shim.o: $(EXEC_SRC) $(EXEC_HDR) | $(BUILD)
 $(BUILD)/sock_client.o: $(SOCK_SRC) $(SOCK_HDR) | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
-$(DIST)/libiec.so: $(SHIM_SRC) $(EXEC_SRC) $(SHIM_HDR) $(EXEC_HDR) $(SOCK_SRC) $(SOCK_HDR) | $(DIST)
-	$(CC) $(CFLAGS) -DINT_PRELOAD -shared -fPIC $(SHIM_SRC) $(EXEC_SRC) $(SOCK_SRC) -o $@ -ldl
+$(BUILD)/rpc.o: $(RPC_SRC) $(RPC_HDR) $(SOCK_HDR) | $(BUILD)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+$(DIST)/libiec.so: $(SHIM_SRC) $(EXEC_SRC) $(RPC_SRC) $(SHIM_HDR) $(EXEC_HDR) $(RPC_HDR) $(SOCK_SRC) $(SOCK_HDR) | $(DIST)
+	$(CC) $(CFLAGS) -DINT_PRELOAD -shared -fPIC $(SHIM_SRC) $(EXEC_SRC) $(RPC_SRC) $(SOCK_SRC) -o $@ -ldl
 
 # --wrap only takes effect at link time and does nothing for an already-built executable, so the shim must be relinked together with the client
-$(DIST)/weston-terminal-wrap: $(BUILD)/shim_tty.o $(BUILD)/exec_shim.o $(BUILD)/sock_client.o scripts/build_client.sh | $(DIST)
+$(DIST)/weston-terminal-wrap: $(BUILD)/shim_tty.o $(BUILD)/exec_shim.o $(BUILD)/sock_client.o $(BUILD)/rpc.o scripts/build_client.sh | $(DIST)
 	WESTON_SRC=$(WESTON_SRC) scripts/build_client.sh -o $@ \
-		$(WRAP_FLAGS) $(BUILD)/shim_tty.o $(BUILD)/exec_shim.o $(BUILD)/sock_client.o
+		$(WRAP_FLAGS) $(BUILD)/shim_tty.o $(BUILD)/exec_shim.o $(BUILD)/sock_client.o $(BUILD)/rpc.o
 
 run: all
 	$(RUN)
 
 clean:
 	rm -f $(DIST)/libiec.so $(DIST)/weston-terminal-wrap $(DIST)/tty_server
-	rm -rf $(BUILD)/shim_tty.o $(BUILD)/sock_client.o $(BUILD)/weston-term
+	rm -rf $(BUILD)/shim_tty.o $(BUILD)/exec_shim.o $(BUILD)/sock_client.o $(BUILD)/rpc.o $(BUILD)/weston-term

@@ -128,6 +128,10 @@ std::vector<uint8_t> encode(uint32_t op, const std::vector<uint8_t>& body) {
 SockServer::SockServer(std::string path) : path_(std::move(path)) {}
 
 SockServer::~SockServer() {
+    // First, before anything else: a thread that is still in run() polls
+    // listen_fd_ and calls back into this object, so closing the fd or unlinking
+    // the path under it would be a race at best.
+    stopAndJoin();
     if (listen_fd_ >= 0) close(listen_fd_);
     // Only an instance that actually bound successfully removes the socket file, otherwise it would wrongly delete one someone else is using
     if (bound_ && !path_.empty()) unlink(path_.c_str());
@@ -249,6 +253,22 @@ void SockServer::run() {
 }
 
 void SockServer::stop() { running_ = 0; }
+
+void SockServer::startThread() {
+    // Assigning over a still-joinable thread would end the process, so a second
+    // start while one is running is deliberately a no-op.
+    if (thread_.joinable()) return;
+    thread_ = std::thread([this] { run(); });
+}
+
+void SockServer::stopAndJoin() {
+    stop();
+    // join() rather than detach(): the loop has to be gone before the destructor
+    // frees anything. It leaves thread_ non-joinable, which is what makes a second
+    // call -- and a call on a server that never had a thread -- harmless. run()
+    // wakes up on its own poll timeout at the latest, so this cannot hang.
+    if (thread_.joinable()) thread_.join();
+}
 
 bool SockServer::drain(int fd, Conn& c) {
     while (c.buf.size() >= 4) {

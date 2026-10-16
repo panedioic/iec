@@ -23,6 +23,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 constexpr uint32_t kHeaderLen = 16;
@@ -83,7 +84,26 @@ public:
     // Single-threaded poll event loop, until stop()
     void run();
 
+    // Only sets the stop flag, so it is the one call that is safe from a signal
+    // handler; see stopAndJoin() for the blocking counterpart.
     void stop();
+
+    // Runs run() on a thread of its own and returns at once. start() must have
+    // been called first, so the socket is already bound and listening. The thread
+    // is reaped by stopAndJoin() or by the destructor.
+    //
+    // A word of warning for derived classes: the derived destructor runs *before*
+    // the base one, and until the thread is joined it is still inside run(),
+    // reaching that half-destroyed derived object through the virtual
+    // addPollFds()/pollEvent() hooks. A derived class that owns an fd run() polls
+    // (a pty end, say) and releases it in its own destructor therefore has to call
+    // stopAndJoin() as the first thing that destructor does. The call made in
+    // ~SockServer() comes too late to save it.
+    void startThread();
+
+    // Asks the loop to stop (same flag as stop()) and joins the thread. Safe to
+    // call more than once, and safe on a server whose thread was never started.
+    void stopAndJoin();
 
 protected:
     // Fds a derived class owns (the pty pairs, for the tty server). run()
@@ -126,5 +146,8 @@ private:
     bool bound_ = false;   // whether bind succeeded (decides whether to remove the socket file on destruction)
     // Read and written by the signal handler, so use sig_atomic_t rather than std::atomic
     volatile sig_atomic_t running_ = 1;
+    // Only ever touched by the calling thread; empty until startThread() runs and
+    // after stopAndJoin() has joined it, which is what makes the latter idempotent.
+    std::thread thread_;
     std::map<uint32_t, Handler> handlers_;
 };
