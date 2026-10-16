@@ -28,6 +28,7 @@ private:
     bool onTcsetpgrp(const Packet& req, Reply& reply);
     bool onGetWinsz(const Packet& req, Reply& reply);
     bool onSetWinsz(const Packet& req, Reply& reply);
+    bool onIdentify(const Packet& req, Reply& reply);
 
     // The pty ends this server holds are its own kind of connection; run() knows
     // nothing about them, so they are polled through these two hooks.

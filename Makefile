@@ -25,7 +25,7 @@ DIST  := dist
 BUILD := build
 
 CFLAGS   += -Wall -Icommon -D_GNU_SOURCE
-CXXFLAGS += -Wall -Icommon
+CXXFLAGS += -Wall -Icommon -D_GNU_SOURCE
 SHIM_SRC := tty/shim.c
 SHIM_HDR := common/intercept.h common/rpc.h common/sock_operation.h
 EXEC_SRC := exec/shim.c

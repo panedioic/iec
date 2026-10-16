@@ -44,6 +44,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
@@ -69,6 +70,13 @@ struct Pty {
     int term_fd = -1;    // A[1], our end of the terminal side
     int app_fd = -1;     // B[0], our end of the program side
     int slave_fd = -1;   // B[1], ours only until OPENPTS hands it to the client
+    // The ends handed to the client, remembered by the inode of the socket each one
+    // is. That is the part of them that outlives their fd numbers: the same socket
+    // object reports the same inode however it is numbered now, however often it has
+    // been dup'd, and across an exec. It is what OP_IDENTIFY matches on when a client
+    // has lost which pty one of its descriptors is.
+    ino_t ino_master = 0;   // A[0], the end the client holds as its master
+    ino_t ino_slave = 0;    // B[1], the end it holds as its slave
     bool term_eof = false;
     bool app_eof = false;
     pid_t fg_pgrp = 0;   // foreground process group of this pty, for signals
@@ -82,6 +90,14 @@ struct Pty {
 
 Pty g_pty[kMaxPtys];
 int g_next_pts = 0;
+
+// The inode of a socket, or 0 when there is none to be had. A socketpair gives each
+// of its ends an inode of its own, and every name for one end -- a dup, a descriptor
+// that has been through SCM_RIGHTS, the same fd after an exec -- reports that one.
+ino_t InodeOf(int fd) {
+    struct stat st;
+    return fstat(fd, &st) == 0 ? st.st_ino : 0;
+}
 
 Pty* allocPty() {
     for (int i = 0; i < kMaxPtys; i++)
@@ -356,6 +372,7 @@ TtyServer::TtyServer(const std::string& path) : SockServer(path) {
     registerHandler(OP_TCSETPGRP,  std::bind(&TtyServer::onTcsetpgrp, this, _1, _2));
     registerHandler(OP_GETWINSZ,   std::bind(&TtyServer::onGetWinsz, this, _1, _2));
     registerHandler(OP_SETWINSZ,   std::bind(&TtyServer::onSetWinsz, this, _1, _2));
+    registerHandler(OP_IDENTIFY,   std::bind(&TtyServer::onIdentify, this, _1, _2));
 }
 
 bool TtyServer::onPing(const Packet& req, Reply& reply) {
@@ -417,6 +434,8 @@ bool TtyServer::onOpenPtmx(const Packet& req, Reply& reply) {
     e->fg_pgrp = 0;
     e->term_eof = false;
     e->app_eof = false;
+    e->ino_master = 0;
+    e->ino_slave = 0;
     e->line.clear();
     e->to_app.clear();
     e->to_term.clear();
@@ -424,6 +443,10 @@ bool TtyServer::onOpenPtmx(const Packet& req, Reply& reply) {
 
     // The client needs the pts number to build "/dev/pts/<n>" later.
     put32(reply.body, static_cast<uint32_t>(e->pts_n));
+    // Read before the framework closes it: this is the only moment at which the end
+    // the client is about to hold is still here to be named, and its inode is what
+    // lets the service recognize that descriptor again (see onIdentify).
+    e->ino_master = InodeOf(a[0]);
     // The framework closes a[0] once the kernel has taken its own reference.
     reply.fds.push_back(a[0]);
 
@@ -445,6 +468,9 @@ bool TtyServer::onOpenPts(const Packet& req, Reply& reply) {
         return false;
     }
 
+    // Read here for the same reason as the master's in onOpenPtmx: this is the last
+    // moment at which the end the client is about to hold is still on this side.
+    e->ino_slave = InodeOf(e->slave_fd);
     reply.fds.push_back(e->slave_fd);
     // Transferred, not copied: a second copy here would keep the master from
     // ever seeing the program exit. The client reopens by name with a local dup
@@ -538,6 +564,54 @@ bool TtyServer::onSetWinsz(const Packet& req, Reply& reply) {
     // terminal that cannot be resized looks like from the inside.
     if (changed) signalFg(*e, SIGWINCH);
     return true;
+}
+
+// Names the pty a descriptor belongs to, for a client whose shim has lost the
+// mapping: an exec replaces the image and the fd table with it, and only the three
+// descriptors login_tty takes over can have their pts number carried across one in
+// the environment. A terminal left on any other fd, or a program started with an
+// environment that does not name the pts at all, has no other way back.
+//
+// The descriptor arrives over SCM_RIGHTS, so it is the same socket object this
+// service handed over -- whatever fd number names it now, however often it has been
+// duplicated, and across an exec. What matches it is the inode of the end that was
+// sent, which is that object's own and does not change. Two checks keep an unrelated
+// descriptor from matching a record whose socket is long gone: it has to be a socket,
+// and a socket this process made -- SO_PEERCRED reports the process that created it,
+// not whoever holds the far end -- which is what rules out the client's own sockets
+// and its connections here.
+//
+// An empty reply is "not one of mine"; eight bytes are [pts][is_master], which is
+// what a shim needs to rebuild its entry, master and slave behaving differently. The
+// received fd is not closed here: the framework closes what it handed to a handler.
+bool TtyServer::onIdentify(const Packet& req, Reply& reply) {
+    struct stat st;
+    struct ucred cred;
+    socklen_t cred_len = sizeof cred;
+
+    if (req.fds.size() != 1) {
+        fprintf(stderr, "[server] identify: expected one fd, got %zu\n", req.fds.size());
+        return false;
+    }
+    int fd = req.fds[0];
+
+    if (fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode)) return true;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0 ||
+        cred.pid != getpid())
+        return true;
+
+    for (int i = 0; i < kMaxPtys; i++) {
+        Pty& e = g_pty[i];
+        bool master;
+        if (!e.used) continue;
+        if (e.ino_master != 0 && st.st_ino == e.ino_master) master = true;
+        else if (e.ino_slave != 0 && st.st_ino == e.ino_slave) master = false;
+        else continue;
+        put32(reply.body, static_cast<uint32_t>(e.pts_n));
+        put32(reply.body, master ? 1u : 0u);
+        return true;
+    }
+    return true;   // empty: not one of ours
 }
 
 void TtyServer::addPollFds(std::vector<pollfd>& fds) {

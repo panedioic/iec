@@ -51,6 +51,14 @@ enum OpTty {
     OP_GETWINSZ  = OP_TTY_START + 8,  /* [pts]              -> struct winsize */
     OP_SETWINSZ  = OP_TTY_START + 9,  /* [pts][winsize] */
 
+    /* One fd attached (SCM_RIGHTS), no body -> [pts][is_master], or an empty body
+     * for "not one of mine". Which pty a descriptor belongs to, asked by a shim that
+     * has lost the mapping: an exec replaces the image and the table with it, and
+     * only the three descriptors login_tty takes over can have their pts number
+     * carried in the environment. The service recognises the fd by the socket it is
+     * (see TtyServer::onIdentify), so the descriptor is the whole of the request. */
+    OP_IDENTIFY  = OP_TTY_START + 10,
+
     OP_TTY_END,
 };
 

@@ -12,7 +12,9 @@
 // What the client gets is not a tty, though, so the tty-flavoured calls are
 // answered here. They fall into two groups. The ones that ask which terminal an
 // fd is (isatty, ttyname, TIOCGPTN, the byte routing of open()) are answered
-// from the local fd table. The ones that describe terminal state -- termios,
+// from the local fd table and, where that table has nothing to say -- which is
+// what an exec leaves behind -- by asking the service which pty the descriptor
+// is again; see identify(). The ones that describe terminal state -- termios,
 // window size, foreground process group -- are asked of the server, which owns
 // that state because it is the only process that can act on it: it is the one
 // that sees every keystroke and the one that raises the signals.
@@ -31,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
@@ -101,16 +104,23 @@ static int (*real_ttyname_r)(int, char *, size_t);
 /* ------------------------------------------------------------------ */
 
 struct shim_fd {
-    int used;
+    int state;
     int is_master;
     int pts_n;
 };
+
+/* A fd is one of the service's ptys, known not to be, or not asked about yet. The
+ * third state is what keeps identify()'s question to one per fd: tty questions are
+ * asked in loops -- stdio asks whether a descriptor is a terminal before it decides
+ * how to buffer, readline asks again on every line -- so a round trip per call would
+ * be paid by every program with one of these hooks on its path. */
+enum { kFdUnasked = 0, kFdOurs, kFdNotOurs };
 
 static struct shim_fd g_fd[SHIM_MAX_FD];
 
 /* Returns the pts number behind an fd, or -1 if this fd is not one of ours. */
 static int pts_of(int fd) {
-    if (fd < 0 || fd >= SHIM_MAX_FD || !g_fd[fd].used) return -1;
+    if (fd < 0 || fd >= SHIM_MAX_FD || g_fd[fd].state != kFdOurs) return -1;
     return g_fd[fd].pts_n;
 }
 
@@ -121,7 +131,7 @@ static int pts_of(int fd) {
 static int fd_for_pts(int pts_n, int want_master) {
     int fd;
     for (fd = 0; fd < SHIM_MAX_FD; fd++) {
-        if (!g_fd[fd].used) continue;
+        if (g_fd[fd].state != kFdOurs) continue;
         if (g_fd[fd].pts_n != pts_n) continue;
         if (g_fd[fd].is_master == want_master) return fd;
     }
@@ -130,7 +140,7 @@ static int fd_for_pts(int pts_n, int want_master) {
 
 static void tty_set(int fd, int pts_n, int is_master) {
     if (fd < 0 || fd >= SHIM_MAX_FD) return;
-    g_fd[fd].used = 1;
+    g_fd[fd].state = kFdOurs;
     g_fd[fd].is_master = is_master;
     g_fd[fd].pts_n = pts_n;
 }
@@ -143,7 +153,7 @@ static void tty_clear(int fd) {
  * isatty(0)/tcgetattr(0) work in the shell child after login_tty(). */
 static void tty_copy(int from, int to) {
     if (from < 0 || from >= SHIM_MAX_FD || to < 0 || to >= SHIM_MAX_FD) return;
-    if (!g_fd[from].used) return;
+    if (g_fd[from].state != kFdOurs) return;
     g_fd[to] = g_fd[from];
 }
 
@@ -180,6 +190,60 @@ static void body_put32(uint8_t *p, uint32_t v) { iec_put32(p, v); }
 static int rpc_call(uint32_t op, const void *body, uint32_t len,
                     void *out, uint32_t out_max, uint32_t *out_len) {
     return iec_rpc_call(TTY_SOCK_PATH, op, body, len, out, out_max, out_len);
+}
+
+/* For the one request that carries a descriptor the other way: it is not in the
+ * body, it rides along with it. */
+static int rpc_call_fds(uint32_t op, const int *fds, int nfds,
+                        void *out, uint32_t out_max, uint32_t *out_len) {
+    return iec_rpc_call_fds(TTY_SOCK_PATH, op, NULL, 0, fds, nfds, out, out_max, out_len);
+}
+
+/* Which pty a descriptor is, asked of the service, for when the table does not
+ * know.
+ *
+ * The table does not survive an exec, and the pts number can only be carried across
+ * one in the environment (see shim_resume_from_exec) -- which covers the three
+ * descriptors login_tty takes over and nothing else. A terminal left on some other
+ * fd, or a program started with an environment that does not name the pts at all,
+ * would otherwise see an ordinary socket where its terminal should be and answer
+ * isatty() with no. So there is one more way to find out: the service still holds
+ * the end it handed over, and the descriptor is that same socket object, so it can
+ * name the pty again and the table can be rebuilt for this fd.
+ *
+ * Only a socket can be one of ours, which is worth checking here: it costs no round
+ * trip, it is true of everything else a process holds -- a file, a pipe, a real
+ * terminal -- for which the kernel has the answer anyway, and it keeps the question
+ * off the path of programs that never had a pty. Whatever the answer turns out to
+ * be it is remembered, so a fd is asked about once and not once per call. */
+static int identify(int fd) {
+    uint8_t resp[8];
+    uint32_t len = 0;
+    struct stat st;
+    int n, is_master;
+
+    int known = pts_of(fd);              /* the table may already know this fd */
+    if (known >= 0) return known;
+    if (fd < 0 || fd >= SHIM_MAX_FD) return -1;
+    if (g_fd[fd].state == kFdNotOurs) return -1;
+
+    if (fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode)) {
+        g_fd[fd].state = kFdNotOurs;
+        return -1;
+    }
+
+    /* Failing to reach the service is not an answer, so it is not remembered: the
+     * next question can still be answered if the service is there by then. */
+    if (rpc_call_fds(OP_IDENTIFY, &fd, 1, resp, sizeof resp, &len) < 0) return -1;
+    if (len < sizeof resp) {            /* an empty reply is "not one of mine" */
+        g_fd[fd].state = kFdNotOurs;
+        return -1;
+    }
+
+    n = (int)body_get32(resp);
+    is_master = (int)body_get32(resp + 4);
+    tty_set(fd, n, is_master);
+    return n;
 }
 
 static int rpc_fixed(uint32_t op, const uint8_t *req, uint32_t len,
@@ -364,7 +428,7 @@ int IEC_EXPORT(fcntl)(int fd, int cmd, ...) {
 }
 
 int IEC_EXPORT(isatty)(int fd) {
-    if (pts_of(fd) >= 0) return 1;
+    if (identify(fd) >= 0) return 1;
     RESOLVE(real_isatty, isatty);
     return real_isatty(fd);
 }
@@ -376,7 +440,7 @@ int IEC_EXPORT(isatty)(int fd) {
  * it cannot get one ("cannot set terminal process group"). */
 char *IEC_EXPORT(ttyname)(int fd) {
     static char buf[32];
-    int n = pts_of(fd);
+    int n = identify(fd);
 
     if (n < 0) {
         RESOLVE(real_ttyname, ttyname);
@@ -387,7 +451,7 @@ char *IEC_EXPORT(ttyname)(int fd) {
 }
 
 int IEC_EXPORT(ttyname_r)(int fd, char *buf, size_t buflen) {
-    int n = pts_of(fd);
+    int n = identify(fd);
     int len;
 
     if (n < 0) {
@@ -401,7 +465,7 @@ int IEC_EXPORT(ttyname_r)(int fd, char *buf, size_t buflen) {
 }
 
 int IEC_EXPORT(tcgetattr)(int fd, struct termios *tio) {
-    int n = pts_of(fd);
+    int n = identify(fd);
     struct termios got;
 
     if (n < 0) {
@@ -415,7 +479,7 @@ int IEC_EXPORT(tcgetattr)(int fd, struct termios *tio) {
 }
 
 int IEC_EXPORT(tcsetattr)(int fd, int actions, const struct termios *tio) {
-    int n = pts_of(fd);
+    int n = identify(fd);
 
     if (n < 0) {
         RESOLVE(real_tcsetattr, tcsetattr);
@@ -431,7 +495,7 @@ int IEC_EXPORT(tcsetattr)(int fd, int actions, const struct termios *tio) {
  * and when they fail it prints "cannot set terminal process group" and gives up
  * job control entirely. */
 pid_t IEC_EXPORT(tcgetpgrp)(int fd) {
-    int n = pts_of(fd);
+    int n = identify(fd);
 
     if (n < 0) {
         RESOLVE(real_tcgetpgrp, tcgetpgrp);
@@ -441,7 +505,7 @@ pid_t IEC_EXPORT(tcgetpgrp)(int fd) {
 }
 
 int IEC_EXPORT(tcsetpgrp)(int fd, pid_t pgrp) {
-    int n = pts_of(fd);
+    int n = identify(fd);
 
     if (n < 0) {
         RESOLVE(real_tcsetpgrp, tcsetpgrp);
@@ -451,7 +515,7 @@ int IEC_EXPORT(tcsetpgrp)(int fd, pid_t pgrp) {
 }
 
 int IEC_EXPORT(ioctl)(int fd, unsigned long request, ...) {
-    int n = pts_of(fd);
+    int n = identify(fd);
     void *arg;
     va_list ap;
 
@@ -518,20 +582,20 @@ int IEC_EXPORT(getpt)(void) {
 int IEC_EXPORT(grantpt)(int fd) {
     /* Nothing to do: the server already owns the "slave" and hands it over on
      * open("/dev/pts/<n>"). */
-    if (pts_of(fd) >= 0) return 0;
+    if (identify(fd) >= 0) return 0;
     RESOLVE(real_grantpt, grantpt);
     return real_grantpt(fd);
 }
 
 int IEC_EXPORT(unlockpt)(int fd) {
-    if (pts_of(fd) >= 0) return 0;
+    if (identify(fd) >= 0) return 0;
     RESOLVE(real_unlockpt, unlockpt);
     return real_unlockpt(fd);
 }
 
 char *IEC_EXPORT(ptsname)(int fd) {
     static char buf[32];
-    int n = pts_of(fd);
+    int n = identify(fd);
 
     if (n < 0) {
         RESOLVE(real_ptsname, ptsname);
@@ -584,7 +648,7 @@ int IEC_EXPORT(login_tty)(int fd) {
     if (dup2(fd, STDOUT_FILENO) < 0) return -1;
     if (dup2(fd, STDERR_FILENO) < 0) return -1;
 
-    n = pts_of(fd);
+    n = identify(fd);
     if (n >= 0) {
         char v[16];
         snprintf(v, sizeof v, "%d", n);
