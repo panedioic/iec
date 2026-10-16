@@ -149,14 +149,20 @@ void SockServer::start() {
 
     // First probe whether a live server already owns the path: if connect succeeds one exists, and
     // unlinking it would delete its socket file, leaving two servers with clients connecting by luck; only a failed connect means a stale file.
-    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    // Everything the server opens is close-on-exec, and that matters here: the
+    // exec service forks and execs on behalf of clients, so a spawned child would
+    // otherwise inherit the server's listening and connection sockets. It could
+    // accept() on them, and it would hold the listening socket open after the
+    // server is gone. Fds received over SCM_RIGHTS are already CLOEXEC, from
+    // MSG_CMSG_CLOEXEC on the receive side.
+    int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (probe >= 0) {
         bool alive = connect(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
         close(probe);
         if (alive) throw std::runtime_error("already running on " + path_);
     }
 
-    listen_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+    listen_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listen_fd_ < 0) throw std::runtime_error(std::string("socket: ") + strerror(errno));
     unlink(path_.c_str());  // clean up a leftover old socket file
     if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 ||
@@ -197,7 +203,7 @@ void SockServer::run() {
             int fd = fds[i].fd;
 
             if (fd == listen_fd_) {
-                int c = accept(listen_fd_, nullptr, nullptr);
+                int c = accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
                 if (c < 0) {
                     // A failed accept leaves the connection pending, so poll reports it
                     // again right away and the loop would spin at 100% CPU (EMFILE is the

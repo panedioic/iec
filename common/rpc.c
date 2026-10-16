@@ -25,9 +25,18 @@ void iec_put32(uint8_t *p, uint32_t v) {
 
 /* Sends one request and returns 0, or -1 with errno set on failure. The reply
  * body is copied into out (at most out_max bytes) and its real length is left in
- * out_len when out_len is not NULL. */
+ * out_len when out_len is not NULL. Same as iec_rpc_call_fds() without fds. */
 int iec_rpc_call(const char *path, uint32_t op, const void *body, uint32_t len,
                  void *out, uint32_t out_max, uint32_t *out_len) {
+    return iec_rpc_call_fds(path, op, body, len, NULL, 0, out, out_max, out_len);
+}
+
+/* Sends one request, with nfds file descriptors of this process attached to it,
+ * and returns 0 or -1 with errno set. The reply is handled as in
+ * iec_rpc_call(). */
+int iec_rpc_call_fds(const char *path, uint32_t op, const void *body, uint32_t len,
+                     const int *fds, int nfds,
+                     void *out, uint32_t out_max, uint32_t *out_len) {
     sock_client c;
     sock_reply r;
     int rc;
@@ -38,7 +47,7 @@ int iec_rpc_call(const char *path, uint32_t op, const void *body, uint32_t len,
         return -1;
     }
 
-    rc = sock_call(&c, op, body, len, &r);
+    rc = sock_call_fds(&c, op, body, len, fds, nfds, &r);
     if (rc < 0) {
         fprintf(stderr, "[shim] op %u failed: %s\n", (unsigned)op, strerror(errno));
         sock_close(&c);

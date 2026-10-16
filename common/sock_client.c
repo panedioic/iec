@@ -117,7 +117,66 @@ int sock_connect(sock_client *c, const char *path) {
     return 0;
 }
 
+/* Hands the first bytes of the packet to sendmsg() with the fds riding along in
+ * an SCM_RIGHTS control message. Returns the number of bytes written, or -1.
+ *
+ * A stream socket only carries fds on a message that also carries data, which is
+ * why this is only ever used for the first send of a packet: every later send
+ * would attach a second copy of the same descriptors, and the server would
+ * receive the packet several times over. MSG_NOSIGNAL because the server may
+ * have died since the previous call, and SIGPIPE would kill the client instead
+ * of returning EPIPE for the caller to see. */
+static ssize_t send_first_with_fds(int fd, const void *data, size_t len,
+                                   const int *fds, int nfds) {
+    struct msghdr msg;
+    struct iovec iov;
+    char cbuf[CMSG_SPACE(sizeof(int) * SOCK_MAX_FDS)];
+    struct cmsghdr *cm;
+    ssize_t w;
+
+    if (nfds > SOCK_MAX_FDS) nfds = SOCK_MAX_FDS;
+
+    memset(&msg, 0, sizeof msg);
+    iov.iov_base = (void *)data;
+    iov.iov_len = len;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = CMSG_SPACE(sizeof(int) * (size_t)nfds);
+
+    cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int) * (size_t)nfds);
+    memcpy(CMSG_DATA(cm), fds, sizeof(int) * (size_t)nfds);
+
+    do {
+        w = sendmsg(fd, &msg, MSG_NOSIGNAL);
+    } while (w < 0 && errno == EINTR);
+    return w;
+}
+
+/* Sends the packet. With nfds == 0 this is a plain write; with fds attached the
+ * first chunk goes out through sendmsg() and only what sendmsg() did not take is
+ * left for write_full(), so the descriptors are attached exactly once. */
+static int send_packet(int fd, const uint8_t *pkt, size_t len,
+                       const int *fds, int nfds) {
+    size_t sent = 0;
+
+    if (nfds > 0 && fds) {
+        ssize_t w = send_first_with_fds(fd, pkt, len, fds, nfds);
+        if (w <= 0) return -1;   /* w == 0 would mean the fds went nowhere useful */
+        sent = (size_t)w;
+    }
+    return write_full(fd, pkt + sent, len - sent);
+}
+
 int sock_call(sock_client *c, uint32_t op, const void *body, uint32_t len, sock_reply *out) {
+    return sock_call_fds(c, op, body, len, NULL, 0, out);
+}
+
+int sock_call_fds(sock_client *c, uint32_t op, const void *body, uint32_t len,
+                  const int *fds, int nfds, sock_reply *out) {
     uint8_t *pkt;
     uint32_t total = htonl(SOCK_HDR_LEN + len);
     uint16_t hl = htons(SOCK_HDR_LEN), ver = htons(c->version);
@@ -142,7 +201,7 @@ int sock_call(sock_client *c, uint32_t op, const void *body, uint32_t len, sock_
     memcpy(pkt + 8, &o, 4);
     memcpy(pkt + 12, &rsv, 4);
     if (len && body) memcpy(pkt + SOCK_HDR_LEN, body, len);
-    if (write_full(c->fd, pkt, SOCK_HDR_LEN + len) < 0) {
+    if (send_packet(c->fd, pkt, SOCK_HDR_LEN + len, fds, nfds) < 0) {
         free(pkt);
         return -1;
     }

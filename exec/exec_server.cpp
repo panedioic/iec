@@ -43,7 +43,7 @@ struct SpawnRequest {
     std::string cwd;                        // empty is inherit
     LaunchKind kind_hint = LaunchKind::kAuto;   // kAuto = the caller did not decide
     std::vector<InheritedFd> stdio_fds;     // target ∈ {0,1,2}
-    std::vector<InheritedFd> extra_fds;     // target > 2
+    std::vector<InheritedFd> extra_fds;     // target > 2; no request fills this yet
     int         sid = 0;
     bool        sync_wait = true;           // A foreground terminal command always waits.
     std::string proc_name;                  // prctl(PR_SET_NAME)
@@ -156,6 +156,65 @@ pid_t SpawnExec(const SpawnRequest& req) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Inherited fds                                                      */
+/* ------------------------------------------------------------------ */
+
+// A temporary copy of a source fd is taken at or above this number. It only has
+// to sit above every target the request may name (0, 1 and 2), so that taking
+// the copy cannot itself overwrite a descriptor that is still to be filled in.
+constexpr int kTempFdFloor = 10;
+
+// Moves the fds the request carried into the descriptors the request named.
+// Reports whether that worked; a false is fatal for the child.
+//
+// This runs in the child of fork(), before execve(), where only async-signal-safe
+// calls are allowed: dup2(), close() and fcntl() are on that list, printf() and
+// malloc() are not. That is why a failure comes back as a return value instead of
+// a message, and why the caller reports it with write(2).
+//
+// The fds that arrived with the request but were not named as targets need no
+// closing. The server's poll loop receives them with MSG_CMSG_CLOEXEC, so every
+// one of them is close-on-exec and the execve() below drops it; the descriptors
+// dup2() creates in their place do not carry that flag -- dup2() clears
+// FD_CLOEXEC on the new fd, which is POSIX behaviour -- and that is exactly what
+// the child wants, so nothing has to clear or set it by hand here.
+bool InstallInheritedFds(const SpawnRequest& req) {
+    const size_t n = req.stdio_fds.size();
+    int temp[kMaxFds];
+    size_t i, j;
+
+    for (i = 0; i < n; i++) temp[i] = -1;
+
+    // dup2(src, tgt) closes tgt before it duplicates onto it, so an entry whose
+    // source is also the target of another entry would lose that source before it
+    // is used: with {5 -> 0, 0 -> 1}, the first dup2 destroys the fd the second
+    // one is supposed to read. The traffic this shim sends cannot look like that
+    // -- the sources are the descriptors recvmsg() just installed in the server,
+    // far above the 0/1/2 targets -- but the mapping arrives in a request, so it
+    // is checked instead of assumed: a source that some other entry targets is
+    // duplicated to a free high fd first, and the targets are then filled from
+    // the copies.
+    for (i = 0; i < n; i++) {
+        for (j = 0; j < n; j++)
+            if (j != i && req.stdio_fds[j].target_fd == req.stdio_fds[i].source_fd) break;
+        if (j == n) continue;
+        temp[i] = fcntl(req.stdio_fds[i].source_fd, F_DUPFD, kTempFdFloor);
+        if (temp[i] < 0) return false;
+    }
+
+    for (i = 0; i < n; i++) {
+        int source = temp[i] >= 0 ? temp[i] : req.stdio_fds[i].source_fd;
+        if (dup2(source, req.stdio_fds[i].target_fd) < 0) return false;
+    }
+
+    // Each target holds its own copy of the descriptor now, so the temporary
+    // names can go; leaving them would be a leak into the exec'd program.
+    for (i = 0; i < n; i++)
+        if (temp[i] >= 0) close(temp[i]);
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* Overall Spawn and Terimate Function                                */
 /* ------------------------------------------------------------------ */
 
@@ -187,6 +246,16 @@ SpawnResult Spawn(const SpawnRequest& req) {
         // Only write(2) from here on. The parent runs one thread per service, so
         // at the moment of the fork another thread may hold a stdio lock that does
         // not exist in the child; fprintf would deadlock instead of printing.
+        //
+        // The stdio the caller sent comes first: it has to be in place before the
+        // program is entered, and a failure here means the child would run with
+        // the server's own stdin/stdout, which is the very thing fd inheritance
+        // exists to avoid -- so it is reported rather than ignored.
+        if (!InstallInheritedFds(req)) {
+            static const char msg[] = "[exec] inherited fd setup failed\n";
+            if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+            _exit(kExecFailedExit);
+        }
         switch (res.kind) {
             case LaunchKind::kExec:
                 SpawnExec(req);   /* returns only on failure */
@@ -301,20 +370,53 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     // The request is decoded into a SpawnRequest and goes no further; see the note
     // in front of the reply at the end of this function.
     SpawnRequest sr;
-    // Layout: [flags][argc][envc] then NUL-terminated strings in the order
-    // file, cwd, argv..., env...; see the encoder in exec/shim.c for the detail.
+    // Layout: [flags][argc][envc][fd_count] then fd_count target words, then
+    // NUL-terminated strings in the order file, cwd, argv..., env...; see the
+    // encoder in exec/shim.c for the detail.
     const uint8_t* b = req.body.data();
     size_t n = req.body.size();
-    uint32_t flags, argc, envc;
-    size_t off = 12;
+    uint32_t flags, argc, envc, fd_count;
+    size_t off;
 
-    if (n < 12) {
+    if (n < 16) {
         fprintf(stderr, "[exec] request too short: %zu bytes\n", n);
         return false;
     }
     flags = get32(b);
     argc = get32(b + 4);
     envc = get32(b + 8);
+    fd_count = get32(b + 12);
+
+    // One target word per fd that arrived with the request, in the order the
+    // framework received them, so the two lists have to be the same length. A
+    // disagreement cannot be resolved -- whichever way the targets were then
+    // matched up, they might be off by one, and the child would get the caller's
+    // stderr on its stdout -- so the request is refused rather than guessed at.
+    if (fd_count != req.fds.size()) {
+        fprintf(stderr, "[exec] fd_count %u does not match %zu attached fds\n",
+                fd_count, req.fds.size());
+        return false;
+    }
+    if (n < 16 + (size_t)fd_count * 4) {
+        fprintf(stderr, "[exec] request too short for %u fd targets\n", fd_count);
+        return false;
+    }
+
+    // The strings start after the header and the target list, so every offset
+    // below moves with fd_count.
+    off = 16 + (size_t)fd_count * 4;
+    for (uint32_t i = 0; i < fd_count; i++) {
+        uint32_t target = get32(b + 16 + (size_t)i * 4);
+        // Only the three standard descriptors are inherited for now. A target
+        // beyond them would need a launch path that does not exist yet, and
+        // taking the entry while ignoring it would silently drop what the caller
+        // asked for, so an unknown target is an invalid request.
+        if (target > STDERR_FILENO) {
+            fprintf(stderr, "[exec] fd target %u is not a standard descriptor\n", target);
+            return false;
+        }
+        sr.stdio_fds.push_back(InheritedFd{req.fds[i], static_cast<int>(target)});
+    }
 
     // Walks one NUL-terminated string. The length is checked as it goes, so a
     // truncated or hostile request cannot run off the end of the buffer.
@@ -341,9 +443,12 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     // command on a terminal always waits), and no caller pid or process name is
     // carried by the request yet.
 
-    fprintf(stderr, "[exec] file=%s cwd=%s flags=0x%x argc=%u envc=%u fds=%zu\n",
+    fprintf(stderr, "[exec] file=%s cwd=%s flags=0x%x argc=%u envc=%u fds=%zu",
             file.c_str(), cwd.empty() ? "(inherit)" : cwd.c_str(),
             flags, argc, envc, req.fds.size());
+    for (size_t i = 0; i < sr.stdio_fds.size(); i++)
+        fprintf(stderr, " %d->%d", sr.stdio_fds[i].source_fd, sr.stdio_fds[i].target_fd);
+    fputc('\n', stderr);
 
     for (uint32_t i = 0; i < argc; i++) {
         std::string a;
@@ -359,16 +464,13 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     }
     if (off != n) fprintf(stderr, "[exec] %zu trailing bytes ignored\n", n - off);
 
-    // Wired up, so that a request now turns into a real process. Two things are
-    // still missing, and both make the result less useful than it looks:
-    //
-    //   * fd inheritance: stdio_fds and extra_fds are filled by nothing and read
-    //     by nothing, so the child comes up with the server's own stdin/stdout
-    //     instead of the pty slave -- its output lands wherever the server was
-    //     started from, not on a terminal.
-    //   * the client side: the exec hook in exec/shim.c still ignores this reply
-    //     and returns -1 unconditionally, so the caller is told the exec failed
-    //     even when a process really started, and nothing waits for that process.
+    // Wired up, so that a request now turns into a real process whose stdio is
+    // the caller's: the fds that came with the request are dup2'd onto the
+    // targets the request named, in the child, before it execs (see
+    // InstallInheritedFds). One thing is still missing and it makes the result
+    // less useful than it looks: the exec hook in exec/shim.c ignores this reply
+    // and returns -1 unconditionally, so the caller is told the exec failed even
+    // when a process really started, and nothing waits for that process.
     SpawnResult res = Spawn(sr);
     if (res.pid < 0) {
         fprintf(stderr, "[exec] spawn failed: %s\n",

@@ -31,8 +31,17 @@ int  sock_connect(sock_client *c, const char *path);
 
 /* Sends a request and waits for the reply.
  * Returns 0 on success, 1 if the server answered with an error packet
- * (out->body holds the error text), -1 on a communication error. */
+ * (out->body holds the error text), -1 on a communication error.
+ * Same as sock_call_fds() with no fds attached. */
 int  sock_call(sock_client *c, uint32_t op, const void *body, uint32_t len, sock_reply *out);
+
+/* Same, but sends nfds file descriptors of this process along with the request
+ * (SCM_RIGHTS). Only the first SOCK_MAX_FDS are sent; the rest are ignored.
+ * The fds themselves are not part of the body: they arrive on the server side in
+ * the same order, and it is the body that says what each one is for. Passing 0
+ * fds makes this behave exactly like sock_call(). */
+int  sock_call_fds(sock_client *c, uint32_t op, const void *body, uint32_t len,
+                   const int *fds, int nfds, sock_reply *out);
 
 /* Detaches fds[i] from the reply so sock_reply_free will not close it.
  * Returns the fd, or -1 if the index is out of range or already taken. */

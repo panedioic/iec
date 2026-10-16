@@ -23,6 +23,14 @@ void     iec_put32(uint8_t *p, uint32_t v);
 int iec_rpc_call(const char *path, uint32_t op, const void *body, uint32_t len,
                  void *out, uint32_t out_max, uint32_t *out_len);
 
+/* Same, but nfds file descriptors of the calling process are sent along with the
+ * request (SCM_RIGHTS). The fds are not part of the body and the server receives
+ * them in the order they are listed here, so it is up to the body to say what
+ * each one is for. nfds == 0 behaves exactly like iec_rpc_call(). */
+int iec_rpc_call_fds(const char *path, uint32_t op, const void *body, uint32_t len,
+                     const int *fds, int nfds,
+                     void *out, uint32_t out_max, uint32_t *out_len);
+
 /* Same, for a reply that is one struct: a short answer would leave a
  * half-initialised struct behind, so the length has to match exactly. */
 int iec_rpc_fixed(const char *path, uint32_t op, const uint8_t *req, uint32_t len,
