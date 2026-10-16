@@ -20,6 +20,7 @@ private:
     bool onPing(const Packet& req, Reply& reply);
     bool onPong(const Packet& req, Reply& reply);
     bool onExecute(const Packet& req, Reply& reply);
+    bool onWait(const Packet& req, Reply& reply);
 
     // Reaps children that have exited since the previous pass of the event loop;
     // see the note above the definition for why this is a loop hook rather than a

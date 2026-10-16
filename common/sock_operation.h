@@ -57,6 +57,9 @@ enum OpTty {
 enum OpExec {
     // Layout documented next to the encoder in exec/shim.c.
     OP_EXECUTE = OP_EXEC_START,
+    // [4 bytes remote pid] -> [4 bytes state][4 bytes status]; see the wait loop
+    // in exec/shim.c for what the client does with the two answer words.
+    OP_WAIT    = OP_EXEC_START + 1,
 
     OP_EXEC_END,
 };

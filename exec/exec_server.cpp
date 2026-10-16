@@ -64,6 +64,14 @@ struct ProcessInfo {
     std::string cmd;
     int64_t     start_time_ms = 0;
     bool        alive = true;
+    // The raw status word waitpid() returned, which is what OP_WAIT answers with:
+    // it is the only form that still carries _how_ the child ended, so the client
+    // can tell an ordinary exit from a signal death. Meaningful once alive is
+    // false; both fields are filled at the same moment, from the same call.
+    int         status = 0;
+    // The same ending rendered for a human -- an exit code, or 128 + signal for a
+    // signal death. Kept beside the raw word rather than instead of it because the
+    // raw word alone cannot be read at a glance in a log; nothing branches on it.
     int         exit_code = -1;
 };
 
@@ -283,13 +291,24 @@ SpawnResult Spawn(const SpawnRequest& req) {
     info.alive = true;
     procmap[info.pid] = info;
 
-    // sync_wait is still not honoured: nothing here makes the caller wait for the
-    // child. exit_code is filled in later, by the reaper in onTick(), which only
-    // notices the exit on some later pass of the event loop.
+    // sync_wait is still not honoured here: this call returns to the client as soon
+    // as the fork is done. The waiting is done by the client, which polls OP_WAIT
+    // for this pid once it has the reply. The entry above starts out alive, and its
+    // exit is filled in later -- by the reaper in onTick(), or by onWait() for a
+    // client that is polling harder than the event loop passes.
     res.pid = pid;
     return res;
 }
 
+// Ends a child this server started, gently first and with SIGKILL if it is still
+// there 800 ms later. Nothing calls it yet, and that is the gap in the exec
+// handshake: a terminal's ^C reaches the client's stand-in, because that is the
+// process the caller's shell left in the foreground process group, while the
+// program actually running is this server's child, in the server's own group -- so
+// the signal never reaches it and it is left running with nobody waiting for it.
+// Forwarding is what this is for: the stand-in would report the signal it caught
+// to the server (a new op), and the server would call this with the pid it
+// recorded for that stand-in.
 void Terminate(pid_t pid) {
     if (pid <= 0) return;
     kill(pid, SIGTERM);
@@ -308,6 +327,27 @@ ExecServer::ExecServer(const std::string& path) : SockServer(path) {
     registerHandler(OP_PING,       std::bind(&ExecServer::onPing,       this, _1, _2));
     registerHandler(OP_PONG,       std::bind(&ExecServer::onPong,       this, _1, _2));
     registerHandler(OP_EXECUTE,    std::bind(&ExecServer::onExecute,    this, _1, _2));
+    registerHandler(OP_WAIT,       std::bind(&ExecServer::onWait,       this, _1, _2));
+}
+
+// Notes how a child ended. This is one function rather than two copies because
+// the same waitpid() result reaches procmap from two directions: onTick() reaps a
+// child before anybody asked about it, and onWait() reaps one on demand because a
+// client is waiting for it. Both have to leave the entry saying the same thing.
+static void RecordExit(ProcessInfo& info, int status) {
+    info.alive = false;
+    // The raw word, which is what OP_WAIT hands back: it is the only form that
+    // still says whether the child exited or was killed by a signal.
+    info.status = status;
+    // The same ending made readable for a log. A signal death has no exit code of
+    // its own, so it is rendered the way a shell renders it -- 128 + the signal
+    // number -- which stops "killed by SIGTERM" from looking like an ordinary exit.
+    // With WNOHANG and no WUNTRACED/WCONTINUED, waitpid() only ever returns exits
+    // and signal deaths, so the last arm is unreachable and only there to leave the
+    // field defined.
+    info.exit_code = WIFEXITED(status)   ? WEXITSTATUS(status)
+                   : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
+                                         : -1;
 }
 
 // Runs once per pass of the poll loop, whether or not anything arrived, which is
@@ -341,16 +381,7 @@ void ExecServer::onTick() {
 
         auto it = procmap.find(pid);
         if (it == procmap.end()) continue;
-        it->second.alive = false;
-        // A signal death has no exit code of its own, so it is reported the way a
-        // shell reports it -- 128 + the signal number -- which keeps the field a
-        // plain int and stops "killed by SIGTERM" from looking like an ordinary exit.
-        // With WNOHANG and no WUNTRACED/WCONTINUED, waitpid() only ever returns
-        // exits and signal deaths, so the last arm is unreachable and only there to
-        // leave the field defined.
-        it->second.exit_code = WIFEXITED(status)   ? WEXITSTATUS(status)
-                             : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
-                                                   : -1;
+        RecordExit(it->second, status);
     }
 }
 
@@ -464,13 +495,11 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     }
     if (off != n) fprintf(stderr, "[exec] %zu trailing bytes ignored\n", n - off);
 
-    // Wired up, so that a request now turns into a real process whose stdio is
-    // the caller's: the fds that came with the request are dup2'd onto the
-    // targets the request named, in the child, before it execs (see
-    // InstallInheritedFds). One thing is still missing and it makes the result
-    // less useful than it looks: the exec hook in exec/shim.c ignores this reply
-    // and returns -1 unconditionally, so the caller is told the exec failed even
-    // when a process really started, and nothing waits for that process.
+    // A request turns into a real process whose stdio is the caller's: the fds
+    // that came with the request are dup2'd onto the targets the request named, in
+    // the child, before it execs (see InstallInheritedFds). The pid goes back in
+    // the reply, and it is the whole point of the reply: the caller has no other
+    // way to name this child, and OP_WAIT is how it collects the exit status.
     SpawnResult res = Spawn(sr);
     if (res.pid < 0) {
         fprintf(stderr, "[exec] spawn failed: %s\n",
@@ -480,4 +509,60 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     fprintf(stderr, "[exec] spawned pid %d\n", (int)res.pid);
     put32(reply.body, static_cast<uint32_t>(res.pid));
     return true;
+}
+
+// Answers whether one child has finished, and with what status. It is the second
+// half of the exec handshake: the client's stand-in polls this until the state
+// word flips, then leaves with the same status, so that its caller's waitpid()
+// sees what the real program did (see the wait loop in exec/shim.c).
+//
+// Only a pid this server really spawned may be waited for, and procmap is the
+// authority on that, not waitpid() itself: waitpid() would happily answer for any
+// child of this process, and the request names the pid as a plain unsigned word,
+// so a request for -1 -- which collects an arbitrary child -- or for a child of
+// some future feature has to be refused here rather than looked up and passed on.
+bool ExecServer::onWait(const Packet& req, Reply& reply) {
+    if (req.body.size() < 4) {
+        fprintf(stderr, "[exec] wait request too short: %zu bytes\n", req.body.size());
+        return false;
+    }
+    pid_t pid = static_cast<pid_t>(get32(req.body.data()));
+
+    auto it = procmap.find(pid);
+    if (it == procmap.end()) {
+        fprintf(stderr, "[exec] wait for pid %d: not a process this server spawned\n", (int)pid);
+        return false;
+    }
+
+    int status = 0;
+    pid_t reaped = waitpid(pid, &status, WNOHANG);
+    if (reaped == pid) {
+        // Exited by now, and this call is what collected it. The same recording
+        // the reaper does, so the entry reads the same either way.
+        RecordExit(it->second, status);
+        put32(reply.body, 1);
+        put32(reply.body, static_cast<uint32_t>(status));
+        return true;
+    }
+    if (reaped == 0) {
+        // Still running. There is no status yet, so the second word is sent as 0
+        // and the client goes by the state word alone.
+        put32(reply.body, 0);
+        put32(reply.body, 0);
+        return true;
+    }
+
+    // waitpid() failed. ECHILD says the pid is no longer this process's to
+    // collect, and onTick() is the only thing here that collects children, so the
+    // status it recorded is the answer. It is only used when the entry agrees that
+    // the child is gone: a live entry would mean the table and the kernel disagree,
+    // and then the recorded status is not something that was ever observed, so it
+    // must not be passed off as one.
+    if (errno == ECHILD && !it->second.alive) {
+        put32(reply.body, 1);
+        put32(reply.body, static_cast<uint32_t>(it->second.status));
+        return true;
+    }
+    fprintf(stderr, "[exec] waitpid(%d) failed: %s\n", (int)pid, strerror(errno));
+    return false;
 }
