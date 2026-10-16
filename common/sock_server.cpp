@@ -174,6 +174,10 @@ void SockServer::run() {
     std::map<int, Conn> conns;
 
     while (running_) {
+        // Ahead of poll(), so a derived class still gets its turn on a pass where
+        // poll() only times out and no event is delivered at all.
+        onTick();
+
         // Rebuilt from scratch every round rather than kept up to date: a
         // derived class watches and drops fds between rounds, and a pollfd left
         // over from a closed one is a use-after-free waiting to happen.

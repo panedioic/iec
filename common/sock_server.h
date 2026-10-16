@@ -112,6 +112,11 @@ protected:
     // must be appended again on every call.
     virtual void addPollFds(std::vector<pollfd>& fds) { (void)fds; }
 
+    // Called once per pass of the event loop, before it blocks in poll(). A derived
+    // class uses it for work that must happen even when nothing arrives, which is
+    // what pollEvent() cannot cover: poll() timing out wakes nobody.
+    virtual void onTick() {}
+
     // Called for a ready fd that is neither the listen socket nor a client
     // connection, i.e. one added by addPollFds.
     virtual void pollEvent(int fd, short revents) { (void)fd; (void)revents; }
