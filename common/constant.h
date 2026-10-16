@@ -47,3 +47,7 @@
 #define QEMU_NAME_X86_64  "qemu-x86_64"
 #define QEMU_NAME_AARCH64 "qemu-aarch64"
 #define QEMU_ENTRY        "qemu_entry"
+
+#ifndef FAKE_SYSROOT
+#define FAKE_SYSROOT "/workspace/dev/iec/dist/fake_sysroot"
+#endif

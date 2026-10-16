@@ -21,6 +21,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "constant.h"
 #include "elf.h"
 #include "exec_qemu.h"
 #include "exec_so.h"
@@ -111,6 +112,17 @@ static std::string PathForRequest(const std::vector<std::string>& env) {
     return fallback;
 }
 
+// Where a path is looked up when the host says only the app sandbox is reachable: the real
+// root is not there, so an absolute path means one inside the fake root. A relative path
+// is left alone, being relative to a working directory, and the empty string stays empty,
+// which is what keeps the "an empty PATH entry means the working directory" rule below
+// working.
+static std::string UnderFakeRoot(const std::string& path) {
+    if (g_caps.path != 0) return path;
+    if (path.empty() || path[0] != '/') return path;
+    return std::string(FAKE_SYSROOT) + path;
+}
+
 std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env,
                             const std::string& cwd) {
     if (path.find('/') != std::string::npos) return path;
@@ -122,8 +134,11 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
         const size_t colon = dirs.find(':', start);
         const size_t end = colon == std::string::npos ? dirs.size() : colon;
         const std::string dir = dirs.substr(start, end - start);
+        // The search runs in the root the program will be started in, which is the fake
+        // one where only the sandbox is reachable, so an absolute entry means inside it.
+        const std::string in_root = UnderFakeRoot(dir);
         const std::string candidate =
-            dir.empty() ? (cwd.empty() ? path : cwd + "/" + path) : dir + "/" + path;
+            in_root.empty() ? (cwd.empty() ? path : cwd + "/" + path) : in_root + "/" + path;
 
         if (IsExecutableFile(candidate)) return candidate;
         if (colon == std::string::npos) break;
@@ -674,6 +689,12 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     if (!next("cwd", cwd)) return false;
     sr.cwd = cwd;
     sr.sid = 0; // todo: multisession in future.
+    // Every request passes through here, whatever member of the family sent it, which is
+    // why the fake root is applied at this point rather than inside the path search. That
+    // search is only reached by the three calls whose names end in p, and the calls that
+    // name an absolute path -- the shell a terminal starts, for one -- never go near it.
+    // Logged after this, so what the log shows is what will be started.
+    file = UnderFakeRoot(file);
     // The remaining fields keep their defaults: sync_wait is true (a foreground
     // command on a terminal always waits), and no process name is carried by the
     // request yet.
