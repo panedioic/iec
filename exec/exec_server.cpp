@@ -424,6 +424,15 @@ SpawnResult Spawn(const SpawnRequest& req) {
         // not exist in the child; fprintf would deadlock instead of printing.
         ClearInheritedSignalMask();
 
+        // A process group of its own, never the server's. Anything that arrives by
+        // group -- a terminal's job-control signal, the tty service's kill(-pgrp) for
+        // a pty, a shell stopping itself with kill(0, SIGTTIN) because it decided it
+        // was in the background -- would otherwise reach the server as well, and end
+        // the service and every session on it. The group is the child's own pid, so
+        // the parent can name it without being told. setpgid() is on the list of
+        // calls a child of fork() may make.
+        setpgid(0, 0);
+
         // The stdio the caller sent comes next: it has to be in place before the
         // program is entered, and a failure here means the child would run with
         // the server's own stdin/stdout, which is the very thing fd inheritance

@@ -478,7 +478,25 @@ bool TtyServer::onTcgetpgrp(const Packet& req, Reply& reply) {
     Pty* e = ptyOfRequest(req, 4);
     if (!e) return false;
 
-    put32(reply.body, static_cast<uint32_t>(e->fg_pgrp));
+    // Which group holds this terminal in the foreground depends on which side of the
+    // socket is asking. This pty has a holder on each side -- the stand-in the client
+    // built with login_tty, and the program the server runs on its stdio -- and they
+    // are in different sessions, so the group the client named cannot describe a
+    // caller from the other one. Such a caller is told its own group instead, which
+    // is what login_tty would have given it on a real terminal: there the process
+    // that calls it is made the foreground group itself.
+    //
+    // This is not a detail. An interactive shell asks this once while starting up and
+    // takes "not my group" for an answer by stopping itself with kill(0, SIGTTIN) --
+    // which is what the kernel would do to a background process that reads. With the
+    // program in the server's process group, that stopped the server and every
+    // session on it; see setpgid() in Spawn() for the other half of this.
+    pid_t group = e->fg_pgrp;
+    if (group > 0 && req.caller > 0 &&
+        getsid(static_cast<pid_t>(req.caller)) != getsid(group))
+        group = getpgid(static_cast<pid_t>(req.caller));
+
+    put32(reply.body, static_cast<uint32_t>(group));
     return true;
 }
 
