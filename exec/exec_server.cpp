@@ -13,6 +13,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -47,7 +48,8 @@ struct SpawnRequest {
     int         sid = 0;
     bool        sync_wait = true;           // A foreground terminal command always waits.
     std::string proc_name;                  // prctl(PR_SET_NAME)
-    pid_t       caller_pid = 0;             // logic parent pid
+    CallMethod  call_method = CALL_METHOD_END;
+    pid_t       caller_pid = 0;
 };
 
 struct SpawnResult {
@@ -60,6 +62,7 @@ struct SpawnResult {
 struct ProcessInfo {
     pid_t       pid = 0;
     pid_t       parent_pid = 0;
+    pid_t       standin_pid = 0;
     LaunchKind  kind = LaunchKind::kAuto;
     std::string cmd;
     int64_t     start_time_ms = 0;
@@ -138,6 +141,93 @@ static int64_t NowMillis() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+static bool ReplacesCaller(CallMethod method) {
+    switch (method) {
+        case CALL_EXECVE:
+        case CALL_EXECV:
+        case CALL_EXECVP:
+        case CALL_EXECVPE:
+        case CALL_EXECL:
+        case CALL_EXECLP:
+        case CALL_EXECLE:
+            return true;
+        case CALL_METHOD_END:
+            break;
+    }
+    return false;
+}
+
+static bool ReadProcParentPid(pid_t pid, pid_t* out) {
+    char path[64];
+    char buf[1024];
+    const char* p;
+    char* end;
+    long ppid;
+
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    if (n < 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return false;
+    }
+    close(fd);
+    buf[n] = '\0';
+
+    p = strrchr(buf, ')');
+    if (p == nullptr || p[1] == '\0') {
+        errno = EINVAL;
+        return false;
+    }
+    // The line is "<pid> (<comm>) <state> <ppid> ...", so what has to be stepped
+    // over is the closing parenthesis, the spaces after it, the state (always one
+    // character) and the spaces after that -- and only then does the number start.
+    p++;
+    while (*p == ' ') p++;
+    if (*p == '\0') {
+        errno = EINVAL;
+        return false;
+    }
+    p++;                                   // the state field
+    while (*p == ' ') p++;
+    errno = 0;
+    ppid = strtol(p, &end, 10);
+    if (end == p || ppid <= 0) {
+        errno = EINVAL;
+        return false;
+    }
+    *out = static_cast<pid_t>(ppid);
+    return true;
+}
+
+// The pid to record as the parent of the program a request asks for.
+//
+// An exec replaces the caller, so the program belongs where the caller was: under
+// the caller's parent, not under the caller. Recording the caller instead would
+// put the program one level too deep -- as a child of a process that is only
+// standing in for it -- and the tree would then say the caller still exists and
+// owns a child, which is exactly what an exec has just undone.
+static pid_t ParentPidFor(const SpawnRequest& req) {
+    pid_t ppid = 0;
+
+    if (!ReplacesCaller(req.call_method)) return req.caller_pid;
+
+    if (ReadProcParentPid(req.caller_pid, &ppid)) return ppid;
+
+    // The caller can be gone by now: a stand-in that was killed outright, or one
+    // whose exec raced its own exit. There is no parent to name in that case, and
+    // refusing the request would turn a vanished client into a failure to start a
+    // program that is perfectly startable. The caller's own pid is the fallback --
+    // it is at least the process the request came from -- and it is reported, so
+    // that a table full of entries filed under a dead pid is not a silent thing.
+    fprintf(stderr, "[exec] no parent for caller %d: %s; recording the caller as the parent\n",
+            (int)req.caller_pid, strerror(errno));
+    return req.caller_pid;
 }
 
 /* ------------------------------------------------------------------ */
@@ -309,7 +399,11 @@ SpawnResult Spawn(const SpawnRequest& req) {
     // parent
     ProcessInfo info;
     info.pid = pid;
-    info.parent_pid = req.caller_pid > 0 ? req.caller_pid : getpid();
+    // Where the program belongs in the process tree, which the call method decides;
+    // see ParentPidFor. Deliberately not getpid(): that is the kernel's answer to
+    // "who forked this", and nothing here asks that question.
+    info.parent_pid = ParentPidFor(req);
+    info.standin_pid = req.caller_pid;
     info.kind = res.kind;
     info.cmd = req.path;
     info.start_time_ms = NowMillis();
@@ -399,10 +493,8 @@ static void RecordExit(ProcessInfo& info, int status) {
 // the only place with the whole table in hand -- that drops the children of a
 // client that is gone: for every entry still alive, test whether the client that
 // asked for it is still there, and end the child if not. The pid to test is
-// ProcessInfo::parent_pid, which Spawn() fills from SpawnRequest::caller_pid and
-// which nothing reads yet; note that it needs the request to carry the client's
-// pid first, because no request does today and the field therefore holds this
-// server's own pid. Not implemented.
+// ProcessInfo::standin_pid, which Spawn() fills from SpawnRequest::caller_pid, and
+// the request carries it now. Not implemented.
 void ExecServer::onTick() {
     // In a loop, because several children can have exited since the previous pass
     // and waitpid() reports them one at a time. WNOHANG so this can never stall
@@ -436,22 +528,46 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     // The request is decoded into a SpawnRequest and goes no further; see the note
     // in front of the reply at the end of this function.
     SpawnRequest sr;
-    // Layout: [flags][argc][envc][fd_count] then fd_count target words, then
-    // NUL-terminated strings in the order file, cwd, argv..., env...; see the
-    // encoder in exec/shim.c for the detail.
+    // Layout: [flags][call_method][argc][envc][fd_count] then fd_count target
+    // words, then NUL-terminated strings in the order file, cwd, argv..., env...;
+    // see the encoder in exec/shim.c for the detail. Only what the caller asks for
+    // is in these words: who the caller is comes from the connection the request
+    // arrived on, not from the request itself (see Packet::caller).
     const uint8_t* b = req.body.data();
     size_t n = req.body.size();
-    uint32_t flags, argc, envc, fd_count;
+    uint32_t flags, method, argc, envc, fd_count;
     size_t off;
 
-    if (n < 16) {
+    if (n < 20) {
         fprintf(stderr, "[exec] request too short: %zu bytes\n", n);
         return false;
     }
     flags = get32(b);
-    argc = get32(b + 4);
-    envc = get32(b + 8);
-    fd_count = get32(b + 12);
+    // Which exec the client called. Every value the shim can send is known here,
+    // and anything else is a request this server cannot interpret: the field picks
+    // the rule that decides where the program is filed, so guessing a method would
+    // be guessing at the shape of the table. Such a request is refused.
+    method = get32(b + 4);
+    if (method >= CALL_METHOD_END) {
+        fprintf(stderr, "[exec] unknown call method %u\n", method);
+        return false;
+    }
+    sr.call_method = static_cast<CallMethod>(method);
+    // The pid of the client that sent the request, read off the connection it
+    // arrived on (Packet::caller, from SO_PEERCRED -- see PeerPidOf). It is what
+    // ties a child to the client that asked for it -- and, for an exec, what says
+    // where the program belongs in the tree -- so a request without a usable one is
+    // refused: 0 and the values that read back as negative are not pids a live
+    // caller can have, and accepting one would file the child under an owner that
+    // cannot be tested for liveness later.
+    sr.caller_pid = static_cast<pid_t>(req.caller);
+    if (sr.caller_pid <= 0) {
+        fprintf(stderr, "[exec] invalid caller pid %d\n", (int)sr.caller_pid);
+        return false;
+    }
+    argc = get32(b + 8);
+    envc = get32(b + 12);
+    fd_count = get32(b + 16);
 
     // One target word per fd that arrived with the request, in the order the
     // framework received them, so the two lists have to be the same length. A
@@ -463,16 +579,16 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
                 fd_count, req.fds.size());
         return false;
     }
-    if (n < 16 + (size_t)fd_count * 4) {
+    if (n < 20 + (size_t)fd_count * 4) {
         fprintf(stderr, "[exec] request too short for %u fd targets\n", fd_count);
         return false;
     }
 
     // The strings start after the header and the target list, so every offset
     // below moves with fd_count.
-    off = 16 + (size_t)fd_count * 4;
+    off = 20 + (size_t)fd_count * 4;
     for (uint32_t i = 0; i < fd_count; i++) {
-        uint32_t target = get32(b + 16 + (size_t)i * 4);
+        uint32_t target = get32(b + 20 + (size_t)i * 4);
         // Only the three standard descriptors are inherited for now. A target
         // beyond them would need a launch path that does not exist yet, and
         // taking the entry while ignoring it would silently drop what the caller
@@ -506,12 +622,12 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     sr.kind_hint = ResolveKind(sr.path);
     sr.sid = 0; // todo: multisession in future.
     // The remaining fields keep their defaults: sync_wait is true (a foreground
-    // command on a terminal always waits), and no caller pid or process name is
-    // carried by the request yet.
+    // command on a terminal always waits), and no process name is carried by the
+    // request yet.
 
-    fprintf(stderr, "[exec] file=%s cwd=%s flags=0x%x argc=%u envc=%u fds=%zu",
+    fprintf(stderr, "[exec] file=%s cwd=%s flags=0x%x method=%d caller=%d argc=%u envc=%u fds=%zu",
             file.c_str(), cwd.empty() ? "(inherit)" : cwd.c_str(),
-            flags, argc, envc, req.fds.size());
+            flags, (int)sr.call_method, (int)sr.caller_pid, argc, envc, req.fds.size());
     for (size_t i = 0; i < sr.stdio_fds.size(); i++)
         fprintf(stderr, " %d->%d", sr.stdio_fds[i].source_fd, sr.stdio_fds[i].target_fd);
     fputc('\n', stderr);

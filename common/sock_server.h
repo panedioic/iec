@@ -39,6 +39,7 @@ struct Packet {
     uint16_t version = 0;
     uint32_t op = 0;
     uint32_t reserved = 0;
+    uint32_t caller = 0;
     std::vector<uint8_t> body;  // Content
     // Fds that arrived with this packet. The framework owns them and closes them
     // as soon as the handler returns, so dup any you want to keep.
@@ -131,6 +132,10 @@ private:
         // Fds that arrived but whose packet is not complete yet, keyed by the
         // absolute stream offset they were attached to.
         std::map<uint64_t, std::vector<int>> fds;
+        // The peer pid read when this connection was accepted. Fixed for the life of
+        // the connection, so it is stamped on every packet that arrives on it; see
+        // PeerPidOf().
+        int peer_pid = 0;
     };
 
     // Extract all complete packets from the buffer and dispatch them; returning false means the connection should be closed

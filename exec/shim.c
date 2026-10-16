@@ -273,18 +273,17 @@ __attribute__((noreturn)) static void become_stand_in(uint32_t remote_pid) {
     _exit(EXEC_STATUS_LOST);
 }
 
-static int exec_common(const char *file, char *const argv[], char *const envp[]) {
+static int exec_common(enum CallMethod method, const char *file,
+                       char *const argv[], char *const envp[]) {
     /* Compact request for OP_EXECUTE. Everything is length-delimited by the
      * packet itself plus NUL terminators, and the decoder checks the buffer end
      * as it walks, so a truncated or hostile request cannot run off it:
      *
-     *   [0..3]   flags      bit0 = the caller waits for the child. The server does
-     *                       not act on it: the waiting is done on this side, by
-     *                       polling OP_WAIT (see become_stand_in)
-     *                       bit1 = hand the child our stdio
-     *   [4..7]   argc
-     *   [8..11]  envc
-     *   [12..15] fd_count
+     *   [0..3]   flags       bit0 = the caller waits for the child.
+     *   [4..7]   call_method 
+     *   [8..11]  argc
+     *   [12..15] envc
+     *   [16..19] fd_count
      *   fd_count x [4 bytes target_fd]
      *   then NUL-terminated strings, in this order:
      *     file, cwd (empty means inherit)
@@ -327,12 +326,13 @@ static int exec_common(const char *file, char *const argv[], char *const envp[])
 
     /* The strings start after the header and the target list, so the offset of
      * every string below moves with fd_count. */
-    off = 16 + 4 * (size_t)nfds;
+    off = 20 + 4 * (size_t)nfds;
     body_put32(req, EXEC_FLAG_WAIT | (nfds > 0 ? EXEC_FLAG_STDIO : 0u));
-    body_put32(req + 4, (uint32_t)argc);
-    body_put32(req + 8, (uint32_t)envc);
-    body_put32(req + 12, (uint32_t)nfds);
-    for (i = 0; i < (size_t)nfds; i++) body_put32(req + 16 + 4 * i, targets[i]);
+    body_put32(req + 4, (uint32_t)method);
+    body_put32(req + 8, (uint32_t)argc);
+    body_put32(req + 12, (uint32_t)envc);
+    body_put32(req + 16, (uint32_t)nfds);
+    for (i = 0; i < (size_t)nfds; i++) body_put32(req + 20 + 4 * i, targets[i]);
 
 #define PUT_CSTR(s)                                     \
     do {                                                \
@@ -379,19 +379,19 @@ too_long:
 /* ------------------------------------------------------------------ */
 
 int IEC_EXPORT(execve)(const char *path, char *const argv[], char *const envp[]) {
-    return exec_common(path, argv, envp);
+    return exec_common(CALL_EXECVE, path, argv, envp);
 }
 
 int IEC_EXPORT(execv)(const char *path, char *const argv[]) {
-    return exec_common(path, argv, NULL);
+    return exec_common(CALL_EXECV, path, argv, NULL);
 }
 
 int IEC_EXPORT(execvp)(const char *file, char *const argv[]) {
-    return exec_common(file, argv, NULL);
+    return exec_common(CALL_EXECVP, file, argv, NULL);
 }
 
 int IEC_EXPORT(execvpe)(const char *file, char *const argv[], char *const envp[]) {
-    return exec_common(file, argv, envp);
+    return exec_common(CALL_EXECVPE, file, argv, envp);
 }
 
 int IEC_EXPORT(execl)(const char *path, const char *arg0, ...) {
@@ -401,7 +401,7 @@ int IEC_EXPORT(execl)(const char *path, const char *arg0, ...) {
     va_start(ap, arg0);
     va_to_argv(arg0, ap, argv, 64);
     va_end(ap);
-    return exec_common(path, argv, NULL);
+    return exec_common(CALL_EXECL, path, argv, NULL);
 }
 
 int IEC_EXPORT(execlp)(const char *file, const char *arg0, ...) {
@@ -411,7 +411,7 @@ int IEC_EXPORT(execlp)(const char *file, const char *arg0, ...) {
     va_start(ap, arg0);
     va_to_argv(arg0, ap, argv, 64);
     va_end(ap);
-    return exec_common(file, argv, NULL);
+    return exec_common(CALL_EXECLP, file, argv, NULL);
 }
 
 /* execle is the odd one out: the environment follows the terminating NULL of the
@@ -425,5 +425,5 @@ int IEC_EXPORT(execle)(const char *path, const char *arg0, ...) {
     va_to_argv(arg0, ap, argv, 64);
     envp = va_arg(ap, char *const *);
     va_end(ap);
-    return exec_common(path, argv, envp);
+    return exec_common(CALL_EXECLE, path, argv, envp);
 }

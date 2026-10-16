@@ -54,8 +54,34 @@ enum OpTty {
     OP_TTY_END,
 };
 
+/* How a client entered the exec service, i.e. which member of the exec family it
+ * called. The family all means the same thing -- the program takes the caller's
+ * place -- and the seven members differ only in how the program is named and
+ * where the environment comes from, so a server that wants to know where the
+ * program belongs in the process tree needs the distinction rather than a single
+ * "exec happened" flag. A future spawn-family call (one that gives the caller a
+ * child instead of replacing it) would need its own method here, and then the
+ * act of spawning really would differ, not just the argument list.
+ *
+ * Plain enum like the op enums above, so this header also compiles as C. */
+enum CallMethod {
+    CALL_EXECVE, CALL_EXECV, CALL_EXECVP, CALL_EXECVPE,
+    CALL_EXECL, CALL_EXECLP, CALL_EXECLE,
+
+    /* Not a call method, and never sent: the count, so that a request carrying a
+     * method can be checked against a bound instead of against the last member by
+     * name (which would silently widen the check if a member were ever added).
+     * Follows the _END convention of the op enums above. */
+    CALL_METHOD_END,
+};
+
 enum OpExec {
-    // Layout documented next to the encoder in exec/shim.c.
+    // [flags][call_method][argc][envc][fd_count], then fd_count 4-byte target_fd
+    // words, then the NUL-terminated strings. The caller's pid is not part of this
+    // body, nor of the packet: the server reads it off the connection with
+    // SO_PEERCRED (see Packet::caller). Both the encoder and the decoder carry the
+    // full description: exec/shim.c next to the request buffer, and
+    // ExecServer::onExecute().
     OP_EXECUTE = OP_EXEC_START,
     // [4 bytes remote pid] -> [4 bytes state][4 bytes status]; see the wait loop
     // in exec/shim.c for what the client does with the two answer words.

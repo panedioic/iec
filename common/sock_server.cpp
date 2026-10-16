@@ -83,6 +83,17 @@ ssize_t recvWithFds(int fd, void* data, size_t len, std::vector<int>& out_fds) {
     return r;
 }
 
+int PeerPidOf(int fd) {
+    struct ucred cred;
+    socklen_t len = sizeof cred;
+
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) {
+        fprintf(stderr, "[server] SO_PEERCRED failed: %s\n", strerror(errno));
+        return 0;
+    }
+    return static_cast<int>(cred.pid);
+}
+
 }  // namespace
 
 void put32(std::vector<uint8_t>& v, uint32_t x) {
@@ -217,7 +228,9 @@ void SockServer::run() {
                     fprintf(stderr, "[server] too many clients, dropping connection\n");
                     close(c);
                 } else {
-                    conns[c];
+                    // The peer credentials are taken once, here, and travel with the
+                    // connection for as long as it lives; see Packet::caller.
+                    conns[c].peer_pid = PeerPidOf(c);
                 }
                 continue;
             }
@@ -296,6 +309,9 @@ bool SockServer::drain(int fd, Conn& c) {
         p.version = get16(&c.buf[6]);
         p.op = get32(&c.buf[8]);
         p.reserved = get32(&c.buf[12]);
+        // Not from the wire: the caller is the peer of the connection this packet
+        // arrived on, which the kernel told us when the connection was accepted.
+        p.caller = static_cast<uint32_t>(c.peer_pid);
         const char* err = validate(p);
         if (err) { sendError(fd, err); return false; }
         p.body.assign(c.buf.begin() + p.header_len, c.buf.begin() + total);
