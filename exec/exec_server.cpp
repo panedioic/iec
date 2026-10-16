@@ -104,9 +104,11 @@ struct HostCapabilities {
  * device. Nothing may branch on them before the probes exist. */
 static HostCapabilities g_caps = {1, 2, 3, 2};
 
-// Every child this server started, keyed by pid. The spawn path writes it and the
-// reaper in onTick() reads it, and both run on the thread that executes run(), so
-// there is no second thread to race with and this deliberately has no lock.
+// Every child this server started, keyed by pid. The spawn path writes it, and the
+// request handlers (onWait, onSignal) read it alongside the reaper in onTick().
+// All of them run on the thread that executes run(), so there is no second thread
+// to race with and this deliberately has no lock; anything added here has to stay
+// on that thread, or the first thing it needs is a mutex.
 static std::unordered_map<pid_t, ProcessInfo> procmap;
 
 /* ------------------------------------------------------------------ */
@@ -231,6 +233,28 @@ bool InstallInheritedFds(const SpawnRequest& req) {
 // produced itself.
 constexpr int kExecFailedExit = 127;
 
+// Puts the child's signal mask back the way a program is entitled to start: empty.
+//
+// The child is forked from an event loop thread, and those run with SIGINT and
+// SIGTERM blocked -- main.cpp blocks them so that a second signal cannot cut the
+// server's own shutdown short (see the sigsuspend there). A mask is inherited
+// across fork() and survives execve(), so without this every program started here
+// would begin life unable to take those two at all: a ^C forwarded to it (see
+// onSignal) would sit pending in the kernel until something unblocked it, which
+// for most programs is never, and the signal would look like it had been ignored.
+//
+// Only the mask needs this. execve() gives every caught signal its default
+// disposition on its own, and the server ignores none of them. A disposition of
+// SIG_IGN such as nohup leaves behind is inherited by design, and is not the
+// server's to override.
+//
+// sigprocmask() is on the list of calls a child of fork() may make.
+void ClearInheritedSignalMask() {
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, nullptr);
+}
+
 SpawnResult Spawn(const SpawnRequest& req) {
     SpawnResult res;
     if (req.path.empty()) { res.error = "path is empty"; return res; }
@@ -254,8 +278,9 @@ SpawnResult Spawn(const SpawnRequest& req) {
         // Only write(2) from here on. The parent runs one thread per service, so
         // at the moment of the fork another thread may hold a stdio lock that does
         // not exist in the child; fprintf would deadlock instead of printing.
-        //
-        // The stdio the caller sent comes first: it has to be in place before the
+        ClearInheritedSignalMask();
+
+        // The stdio the caller sent comes next: it has to be in place before the
         // program is entered, and a failure here means the child would run with
         // the server's own stdin/stdout, which is the very thing fd inheritance
         // exists to avoid -- so it is reported rather than ignored.
@@ -301,14 +326,11 @@ SpawnResult Spawn(const SpawnRequest& req) {
 }
 
 // Ends a child this server started, gently first and with SIGKILL if it is still
-// there 800 ms later. Nothing calls it yet, and that is the gap in the exec
-// handshake: a terminal's ^C reaches the client's stand-in, because that is the
-// process the caller's shell left in the foreground process group, while the
-// program actually running is this server's child, in the server's own group -- so
-// the signal never reaches it and it is left running with nobody waiting for it.
-// Forwarding is what this is for: the stand-in would report the signal it caught
-// to the server (a new op), and the server would call this with the pid it
-// recorded for that stand-in.
+// there 800 ms later. Nothing calls it: the signal a stand-in forwards now goes
+// straight out through kill() in onSignal() below, because there is nothing to
+// escalate to -- the signal has already been chosen by whoever sent it. It is
+// left here as the place a policy would go if one is ever wanted (a deadline on
+// a child that ignored what it was sent, say).
 void Terminate(pid_t pid) {
     if (pid <= 0) return;
     kill(pid, SIGTERM);
@@ -328,6 +350,7 @@ ExecServer::ExecServer(const std::string& path) : SockServer(path) {
     registerHandler(OP_PONG,       std::bind(&ExecServer::onPong,       this, _1, _2));
     registerHandler(OP_EXECUTE,    std::bind(&ExecServer::onExecute,    this, _1, _2));
     registerHandler(OP_WAIT,       std::bind(&ExecServer::onWait,       this, _1, _2));
+    registerHandler(OP_SIGNAL,     std::bind(&ExecServer::onSignal,     this, _1, _2));
 }
 
 // Notes how a child ended. This is one function rather than two copies because
@@ -368,6 +391,18 @@ static void RecordExit(ProcessInfo& info, int status) {
 // to reap its own children, or its exit statuses would be consumed here. A pid
 // that is not in procmap is skipped for the same reason rather than treated as an
 // error.
+//
+// One ending this hook does not catch: a stand-in killed outright, with SIGKILL or
+// by the machine going down. No handler runs in the client for SIGKILL, so nothing
+// is ever asked of this server and the child stays here as a live entry with
+// nobody left to collect it. What it would take is a check in this same loop --
+// the only place with the whole table in hand -- that drops the children of a
+// client that is gone: for every entry still alive, test whether the client that
+// asked for it is still there, and end the child if not. The pid to test is
+// ProcessInfo::parent_pid, which Spawn() fills from SpawnRequest::caller_pid and
+// which nothing reads yet; note that it needs the request to carry the client's
+// pid first, because no request does today and the field therefore holds this
+// server's own pid. Not implemented.
 void ExecServer::onTick() {
     // In a loop, because several children can have exited since the previous pass
     // and waitpid() reports them one at a time. WNOHANG so this can never stall
@@ -565,4 +600,48 @@ bool ExecServer::onWait(const Packet& req, Reply& reply) {
     }
     fprintf(stderr, "[exec] waitpid(%d) failed: %s\n", (int)pid, strerror(errno));
     return false;
+}
+
+// Delivers a signal to a program this server started, on behalf of the stand-in
+// that received it. The stand-in is where a terminal's signals land -- it is what
+// the caller's shell left in the foreground process group -- while the program
+// runs here, in the server's own process group and session, so the kernel never
+// hands it the signal and no kill() aimed at the stand-in reaches it either. This
+// is the other half of the catch-and-forward the client does (see the signal
+// section in exec/shim.c).
+//
+// The pid is checked against procmap first, exactly as onWait() does and for the
+// same reason: the request names it as a plain unsigned word, and without the
+// lookup this would be a general-purpose kill() for any client of this socket --
+// a request for pid -1 or 0 would reach the server's whole process group, and any
+// child of the server could be named. procmap is the authority on which pids this
+// server may be asked about, not the kernel.
+bool ExecServer::onSignal(const Packet& req, Reply& reply) {
+    if (req.body.size() < 8) {
+        fprintf(stderr, "[exec] signal request too short: %zu bytes\n", req.body.size());
+        return false;
+    }
+    pid_t pid = static_cast<pid_t>(get32(req.body.data()));
+    int signo = static_cast<int>(get32(req.body.data() + 4));
+
+    auto it = procmap.find(pid);
+    if (it == procmap.end()) {
+        fprintf(stderr, "[exec] signal %d for pid %d: not a process this server spawned\n",
+                signo, (int)pid);
+        return false;
+    }
+
+    // ESRCH is not a failure. The child can exit between the stand-in catching the
+    // signal and this request arriving, and that race is the normal case for a
+    // signal that ends a program: the status it left behind is what the next
+    // OP_WAIT reports, so there is nothing left to do and nothing wrong. Every
+    // other failure (EINVAL for a signal number that does not exist, EPERM) is
+    // reported to the client rather than swallowed.
+    if (kill(pid, signo) < 0 && errno != ESRCH) {
+        fprintf(stderr, "[exec] kill(%d, %d) failed: %s\n", (int)pid, signo, strerror(errno));
+        return false;
+    }
+    // The reply is empty: whether the signal was accepted or refused is the whole
+    // answer, and the fate of the program shows up in OP_WAIT like any other end.
+    return true;
 }

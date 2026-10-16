@@ -91,6 +91,108 @@ static void va_to_argv(const char *arg0, va_list ap, char *argv[], int max) {
     argv[i] = NULL;
 }
 
+/* ----------------------------------------------------------------------- */
+/* Signal forwarding                                                       */
+/*                                                                         */
+/* A terminal sends ^C, ^Z and a window-size change to the process group   */
+/* it holds in the foreground, and the process the caller's shell put in   */
+/* that group is this stand-in. The program it stands in for runs on the   */
+/* server, in the server's own process group and session, so the kernel    */
+/* never delivers any of those signals to it -- and a kill() aimed at this */
+/* process does not reach it either, which is what makes this worth doing  */
+/* rather than leaving it to the process group. They are caught here and   */
+/* asked for over OP_SIGNAL instead. Without that, ^C ends the stand-in    */
+/* and leaves the program running with nobody waiting for it.              */
+/*                                                                         */
+/* Catching them is also what keeps the stand-in alive: the default action */
+/* of every signal below but SIGCONT and SIGWINCH is to end this process.  */
+/* Ending it is the wrong answer in general -- whether the program dies is */
+/* the program's business, and one that ignores SIGINT is supposed to      */
+/* survive a ^C -- so the stand-in ends when, and only when, OP_WAIT says  */
+/* the program ended.                                                      */
+/* ----------------------------------------------------------------------- */
+
+/* One flag per signal, indexed by signal number. A handler may do nothing but set
+ * one of these: every other way of getting the signal out of the process -- a
+ * socket call, malloc, anything stdio -- is not async-signal-safe, so the
+ * forwarding itself is left to the main loop, which reads these flags.
+ *
+ * A flag rather than a count, deliberately. Signals that arrive again before the
+ * loop gets to them become one delivery to the program at the other end, and for
+ * this set that loses nothing: a second SIGWINCH asks for the same size as the
+ * first, and a program being interrupted does not act twice as interrupted. A
+ * count would need a ceiling to stay defined and would not make any of the seven
+ * behave differently. What has to hold is the other direction -- a signal that
+ * arrives is never dropped -- and a flag gives that. */
+static volatile sig_atomic_t g_raised[NSIG];
+
+static void on_signal(int sig) {
+    g_raised[sig] = 1;
+}
+
+/* What the stand-in catches, in the order it forwards them. What a terminal can
+ * send, and nothing else: SIGTSTP and SIGCONT because job control is the shell's
+ * view of this process, SIGWINCH because the program owns the terminal's size
+ * wherever it runs, and the four that end a foreground job. SIGKILL and SIGSTOP
+ * cannot be caught at all, so a stand-in killed with either does leave its program
+ * behind; see the note in ExecServer::onTick() for where that would be cleaned
+ * up, and why it is not done here. */
+static const int g_forwarded[] = {
+    SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP, SIGCONT, SIGWINCH,
+};
+#define FORWARDED_COUNT ((int)(sizeof g_forwarded / sizeof g_forwarded[0]))
+
+/* OP_SIGNAL: [4 bytes remote pid][4 bytes signo], empty reply. */
+static void forward_signal(uint32_t remote_pid, int sig) {
+    uint8_t req[8];
+
+    body_put32(req, remote_pid);
+    body_put32(req + 4, (uint32_t)sig);
+    /* A failure is reported and nothing more: this process must not die of it,
+     * because the program decides when this ends. If the server really is gone,
+     * the next OP_WAIT fails and takes the normal lost-status way out. */
+    if (rpc_call(OP_SIGNAL, req, sizeof req, NULL, 0, NULL) < 0)
+        report("[shim] exec: could not forward a signal\n");
+}
+
+/* Passes on every signal caught since the previous call, and stops this process
+ * if one of them was SIGTSTP. */
+static void forward_pending(uint32_t remote_pid) {
+    int i;
+
+    for (i = 0; i < FORWARDED_COUNT; i++) {
+        int sig = g_forwarded[i];
+
+        if (!g_raised[sig]) continue;
+        g_raised[sig] = 0;
+        forward_signal(remote_pid, sig);
+
+        if (sig == SIGTSTP) {
+            /* The program has been stopped, and this process has to stop too:
+             * job control is the shell's waitpid() reporting WIFSTOPPED, and a
+             * shell that saw this process still running after ^Z would take the
+             * stop for a failure. Stopping is the default action of the signal,
+             * so the handler has to be out of the way for it to happen at all --
+             * left in place, raise() would run it, set a flag and return.
+             *
+             * The kernel has the last word: a stop signal aimed at a member of an
+             * orphaned process group is discarded rather than honoured, so that a
+             * job no shell could ever resume is not left stopped. A stand-in in
+             * that position (today's case: a session leader with no shell above
+             * it) therefore goes on running here while the program it forwarded
+             * the stop to does stop, and there is nothing this side can do about
+             * it -- the discarding happens on delivery, without an error. */
+            signal(SIGTSTP, SIG_DFL);
+            raise(SIGTSTP);
+            /* Back, so a SIGCONT resumed this process and its handler has already
+             * run; SIGCONT follows SIGTSTP in the list, so the flag it set is
+             * forwarded by the rest of this pass. The handler goes back in so
+             * that a second ^Z stops this process again. */
+            signal(SIGTSTP, on_signal);
+        }
+    }
+}
+
 /* Becomes the remote program's stand-in, and never returns.
  *
  * There is no way to hand a process's exit to another process, so the closest
@@ -99,14 +201,9 @@ static void va_to_argv(const char *arg0, va_list ap, char *argv[], int max) {
  * duplicate: the child is alive the whole time, and the status arrives only once it
  * has ended.
  *
- * Nothing here forwards signals. A terminal delivers ^C to the foreground process
- * group, and what the caller's shell put in that group is this stand-in; the
- * program actually running is a child of the server, which is normally started on
- * its own, in its own process group. The signal therefore ends the stand-in and
- * leaves the real program running, with nobody left to collect it. Closing that gap
- * means catching the signal here and asking the server to pass it on to the pid this
- * process is standing in for (the counterpart is Terminate() in exec_server.cpp,
- * which nothing calls yet), and that is not implemented. */
+ * Signals, on the other hand, are not left to the status: they are caught and
+ * forwarded as they arrive (see above), which makes waiting for the program the
+ * only way this process can end. */
 __attribute__((noreturn)) static void become_stand_in(uint32_t remote_pid) {
     /* OP_WAIT: [4 bytes pid] -> [4 bytes state][4 bytes status]. state is 1 once
      * the child has ended, and only then does status mean anything; see onWait()
@@ -117,9 +214,20 @@ __attribute__((noreturn)) static void become_stand_in(uint32_t remote_pid) {
     uint8_t req[4];
     uint32_t len, state, status;
     struct timespec left, rem;
+    int i;
+
+    /* Before the first request goes out: a ^C arriving in between would end this
+     * process through the default action, which is the ending this whole section
+     * exists to prevent. */
+    for (i = 0; i < FORWARDED_COUNT; i++)
+        signal(g_forwarded[i], on_signal);
 
     body_put32(req, remote_pid);
     for (;;) {
+        /* Ahead of the question below, so a signal caught during the sleep is
+         * passed on at once rather than a round later. */
+        forward_pending(remote_pid);
+
         len = 0;
         if (rpc_call(OP_WAIT, req, sizeof req, answer, sizeof answer, &len) < 0 ||
             len < WAIT_ANSWER) {
@@ -148,7 +256,10 @@ __attribute__((noreturn)) static void become_stand_in(uint32_t remote_pid) {
         int sig = WTERMSIG(status);
         /* Die of the same signal. An ordinary exit with 128 + sig would be
          * indistinguishable from the program having called exit(128 + sig), and
-         * callers really do branch on that difference. */
+         * callers really do branch on that difference. Restoring SIG_DFL first is
+         * what makes that work for the signals above: a handler is installed for
+         * them, and raise() would otherwise run it, set a flag and return, leaving
+         * this process alive for good. */
         signal(sig, SIG_DFL);
         raise(sig);
         /* Reached only when the signal could not end this process -- it was

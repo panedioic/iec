@@ -60,6 +60,11 @@ enum OpExec {
     // [4 bytes remote pid] -> [4 bytes state][4 bytes status]; see the wait loop
     // in exec/shim.c for what the client does with the two answer words.
     OP_WAIT    = OP_EXEC_START + 1,
+    // [4 bytes remote pid][4 bytes signo] -> empty. Asks for a signal to be
+    // delivered to a program this server spawned, on behalf of the stand-in that
+    // caught it; see the signal table in exec/shim.c for why the program cannot
+    // be reached directly.
+    OP_SIGNAL  = OP_EXEC_START + 2,
 
     OP_EXEC_END,
 };
