@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -356,14 +357,22 @@ static int exec_common(enum CallMethod method, const char *file,
     int nfds = 0, fd;
     size_t off, argc = 0, envc = 0, i, len;
     char *const *env;                     /* the environment the request carries */
+    char cwd[PATH_MAX];                   /* and the directory it is started in */
     unsigned kept;                        /* one bit per g_kept entry to put back */
     size_t kept_n = 0;                    /* how many entries that comes to */
 
-    /* What the program is to start with: the environment the call states, or this
-     * process's own when it states none -- both the four with no environment
-     * argument and the NULL an 'e' call may pass land on the second arm; see the
-     * section above for why each arm is what it is. */
+    /* The environment the program is to start with: the one the call states, or this
+     * process's own when the call states none. Both the four with no environment
+     * argument and the NULL an 'e' call may pass land on the second arm -- POSIX
+     * gives those three a way to state an environment and none to ask for an empty
+     * one. */
     env = envp ? envp : (char *const *)environ;
+
+    /* And the directory it is started in: this process's own, which is what every
+     * relative name in the request already means here. An empty one is the server's,
+     * and is what a getcwd() that fails leaves behind -- the directory was removed
+     * under this process, or its path does not fit in PATH_MAX. */
+    if (!getcwd(cwd, sizeof cwd)) cwd[0] = '\0';
 
     if (!file) {
         errno = ENOENT;
@@ -422,7 +431,7 @@ static int exec_common(enum CallMethod method, const char *file,
     } while (0)
 
     PUT_CSTR(file);
-    PUT_CSTR("");                          /* cwd: inherit */
+    PUT_CSTR(cwd);                         /* empty means inherit; see above */
     for (i = 0; i < argc; i++) PUT_CSTR(argv[i]);
     for (i = 0; i < envc; i++) PUT_CSTR(env[i]);
     /* Last, so the caller's own order is what the program reads first. The mask is

@@ -143,7 +143,8 @@ static std::string PathForRequest(const std::vector<std::string>& env) {
     return fallback;
 }
 
-std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env) {
+std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env,
+                            const std::string& cwd) {
     if (path.find('/') != std::string::npos) return path;
 
     const std::string dirs = PathForRequest(env);
@@ -153,7 +154,8 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
         const size_t colon = dirs.find(':', start);
         const size_t end = colon == std::string::npos ? dirs.size() : colon;
         const std::string dir = dirs.substr(start, end - start);
-        const std::string candidate = dir.empty() ? path : dir + "/" + path;
+        const std::string candidate =
+            dir.empty() ? (cwd.empty() ? path : cwd + "/" + path) : dir + "/" + path;
 
         if (IsExecutableFile(candidate)) return candidate;
         if (colon == std::string::npos) break;
@@ -298,9 +300,10 @@ pid_t SpawnExec(const SpawnRequest& req) {
     argv.push_back(nullptr);
     envp.push_back(nullptr);
 
-    // A non-empty cwd asks for the program to be started there; an empty one keeps
-    // the directory the server was started in.
-    if (!req.cwd.empty() && chdir(req.cwd.c_str()) != 0) return -1;
+    if (!req.cwd.empty() && chdir(req.cwd.c_str()) != 0) {
+        static const char msg[] = "[exec] chdir failed, started in default path.\n";
+        if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+    }
 
     execve(req.path.c_str(), argv.data(), envp.data());
     return -1;   // reached only when execve failed
@@ -696,7 +699,7 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     if (off != n) fprintf(stderr, "[exec] %zu trailing bytes ignored\n", n - off);
 
     if (SearchesPath(sr.call_method)) {
-        sr.path = ResolveFilePath(file, sr.env);
+        sr.path = ResolveFilePath(file, sr.env, sr.cwd);
         if (sr.path.empty()) {
             fprintf(stderr, "[exec] %s: no such file on PATH (method %d)\n",
                     file.c_str(), (int)sr.call_method);
