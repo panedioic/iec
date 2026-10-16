@@ -133,18 +133,15 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
 }
 
 LaunchKind ResolveKind(const std::string& path) {
-    // A launcher is a file that says so on its first line, and it is checked before
-    // exec because the case this route exists for is the one where execve is not how
-    // programs are started. A file that claims to be a launcher and then fails to
-    // parse is left to Spawn(), which can tell the client what was wrong with it.
-    if (g_caps.fork == 1) {
-        if (IsSoLauncher(path)) return LaunchKind::kSo;
-        if (g_caps.exec == 2) return LaunchKind::kExec;
-    }
-    
-    uint16_t machine = ElfMachine(path);
+    if (g_caps.fork == 1 && IsSoLauncher(path)) return LaunchKind::kSo;
 
-    if (g_caps.jit > 0) return LaunchKind::kLoader;
+    const uint16_t machine = ElfMachine(path);
+    const bool host_arch = machine == HOST_ARCH;
+
+    if (host_arch && g_caps.fork == 1) {
+        if (g_caps.exec == 2) return LaunchKind::kExec;
+        if (g_caps.jit > 0) return LaunchKind::kLoader;
+    }
 
     if (machine == EM_AARCH64) return LaunchKind::kQemu_aarch64;
     if (machine == EM_X86_64) return LaunchKind::kQemu_x86_64;

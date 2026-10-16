@@ -16,6 +16,14 @@
 #define EM_X86_64  62
 #define EM_AARCH64 183
 
+#if defined __aarch64__
+#  define HOST_ARCH EM_AARCH64
+#elif defined __x86_64__
+#  define HOST_ARCH EM_X86_64
+#else
+#  error "no HOST_ARCH for this architecture: name it here, with the emulator objects it needs"
+#endif
+
 // Whether the file starts with the ELF magic. Deliberately only the magic: a file that
 // claims to be ELF and then cannot be read as one should still be routed, so that the
 // route can say what is wrong with it rather than leaving the client with a bare failure.
