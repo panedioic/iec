@@ -21,6 +21,8 @@
 #include <thread>
 #include <unordered_map>
 
+#include "elf.h"
+#include "exec_qemu.h"
 #include "exec_so.h"
 #include "exec_types.h"
 
@@ -72,12 +74,7 @@ struct HostCapabilities {
      * 2: full-disk is reachable */
     int path = 0;
 };
-/* Probe results for this device: whether fork works, which paths can be exec'd,
- * how a JIT page can be obtained, and how much of the filesystem is reachable.
- * The fields below are hardcoded placeholders -- the probes that should fill them
- * in are not written yet -- and hold the values confirmed by hand on the target
- * device. Nothing may branch on them before the probes exist. */
-static HostCapabilities g_caps = {1, 2, 3, 2};
+static HostCapabilities g_caps = {1, 0, 0, 0};
 
 // Every child this server started, keyed by pid. The spawn path writes it, and the
 // request handlers (onWait, onSignal) read it alongside the reaper in onTick().
@@ -144,6 +141,13 @@ LaunchKind ResolveKind(const std::string& path) {
         if (IsSoLauncher(path)) return LaunchKind::kSo;
         if (g_caps.exec == 2) return LaunchKind::kExec;
     }
+    
+    uint16_t machine = ElfMachine(path);
+
+    if (g_caps.jit > 0) return LaunchKind::kLoader;
+
+    if (machine == EM_AARCH64) return LaunchKind::kQemu_aarch64;
+    if (machine == EM_X86_64) return LaunchKind::kQemu_x86_64;
     return LaunchKind::kUnexecutable;
 }
 
@@ -433,8 +437,16 @@ SpawnResult Spawn(const SpawnRequest& req) {
                     if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
                 }
                 _exit(kExecFailedExit);
+            case LaunchKind::kQemu_x86_64:
+            case LaunchKind::kQemu_aarch64:
+                SpawnQemu(req);   /* returns only on failure */
+                {
+                    static const char msg[] = "[exec] qemu failed\n";
+                    if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+                }
+                _exit(kExecFailedExit);
             default:
-                // kLoader, kQemu_* and kUnexecutable have no router yet.
+                // kLoader and kUnexecutable have no router yet.
                 {
                     static const char msg[] = "[exec] launch kind unsupported\n";
                     if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
