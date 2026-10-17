@@ -52,8 +52,17 @@ const char* const kSysBins[] = {
 
 bool StartsWithSystemBin(const std::string& path) {
     for (const char* dir : kSysBins) {
-        const size_t n = strlen(dir);
-        if (path.size() >= n && path.compare(0, n, dir) == 0) return true;
+        const size_t n = strlen(dir);   // every entry ends with '/'
+        // A PATH entry names the directory itself ("/bin"), while a program
+        // path names something under it ("/bin/ls"). Both live in the fake
+        // root, and the entry form is exactly what a PATH search passes here;
+        // matching only the trailing-slash form made "mksh" search the real
+        // /bin, which the sandbox does not allow.
+        if (path.size() >= n - 1 &&
+            path.compare(0, n - 1, dir, n - 1) == 0 &&
+            (path.size() == n - 1 || path[n - 1] == '/')) {
+            return true;
+        }
     }
     return false;
 }
