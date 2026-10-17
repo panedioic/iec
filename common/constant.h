@@ -8,6 +8,20 @@
 // the objects live somewhere else entirely -- supplies its own.
 #pragma once
 
+/* OHOS defaults. The app sandbox has no writable /tmp, and its shared objects
+ * live in the installed bundle rather than in a developer tree, so the
+ * host-side paths used below cannot be reached on device. Each definition is
+ * still inside #ifndef so a build can override it from the command line. */
+#if defined(__OHOS__)
+
+#define TTY_SOCK_PATH           "/data/storage/el2/base/files/iec-tty.sock"
+#define EXEC_SOCK_PATH          "/data/storage/el2/base/files/iec-exec.sock"
+#define PATH_QEMU_X86_64_SO     "/data/storage/el1/bundle/libs/arm64/libqemu-x86_64.so"
+#define PATH_QEMU_AARCH64_SO    "/data/storage/el1/bundle/libs/arm64/libqemu-aarch64.so"
+#define FAKE_SYSROOT            "/data/storage/el2/base/files"
+
+#endif
+
 /* Where the two services listen, and therefore where the shims look for them. */
 #ifndef TTY_SOCK_PATH
 #define TTY_SOCK_PATH "/tmp/tty_service.sock"
