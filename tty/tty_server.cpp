@@ -51,10 +51,12 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 
 #include "logger/logger.h"
+#include "proc.h"
 
 namespace {
 
@@ -528,9 +530,20 @@ bool TtyServer::onTcgetpgrp(const Packet& req, Reply& reply) {
     // program in the server's process group, that stopped the server and every
     // session on it; see setpgid() in Spawn() for the other half of this.
     pid_t group = e->fg_pgrp;
-    if (group > 0 && req.caller > 0 &&
-        getsid(static_cast<pid_t>(req.caller)) != getsid(group))
-        group = getpgid(static_cast<pid_t>(req.caller));
+    if (group > 0 && req.caller > 0) {
+        const pid_t caller = static_cast<pid_t>(req.caller);
+
+        // A program the exec server started is a direct child of this process
+        // (the tty and exec services share it), while the stand-in that the
+        // shell put in the foreground group is a child of the shell. The
+        // program gets a process group of its own (see setpgid in Spawn), so
+        // the stored group is never its own. Told that, an interactive shell
+        // takes itself for a background job, stops reading and never prints a
+        // prompt -- which is exactly what a nested "sh" looked like.
+        const bool server_child = iec_parent_pid(caller) == getpid();
+        if (server_child || getsid(caller) != getsid(group))
+            group = getpgid(caller);
+    }
 
     put32(reply.body, static_cast<uint32_t>(group));
     return true;
