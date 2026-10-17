@@ -66,6 +66,7 @@ add_executable(iec_server
     exec/exec_qemu.cpp
     exec/exec_shebang.cpp
     exec/elf.cpp
+    logger/logger.cpp
     common/sock_server.cpp)
 
 target_include_directories(iec_server PRIVATE ${IEC_INCLUDES})

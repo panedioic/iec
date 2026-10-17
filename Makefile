@@ -45,7 +45,7 @@ else
 endif
 
 CFLAGS   += -Wall -Icommon -D_GNU_SOURCE $(TREE_PATHS)
-CXXFLAGS += -Wall -Icommon -Iloader -D_GNU_SOURCE -DIEC_PINNED_CAPS=$(PINNED_CAPS) $(TREE_PATHS)
+CXXFLAGS += -Wall -I. -Icommon -Iloader -D_GNU_SOURCE -DIEC_PINNED_CAPS=$(PINNED_CAPS) $(TREE_PATHS)
 SHIM_SRC := tty/shim.c
 SHIM_HDR := common/constant.h common/intercept.h common/rpc.h common/sock_operation.h
 EXEC_SRC := exec/shim.c
@@ -68,12 +68,12 @@ SERVER_BIN  := $(DIST)/iec_server
 SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp exec/path_resolver.cpp exec/caps.cpp \
                exec/exec_loader.cpp loader/loader.cpp $(GUEST_SWITCH_SRC) \
                exec/exec_so.cpp exec/exec_qemu.cpp exec/exec_shebang.cpp exec/elf.cpp \
-               common/sock_server.cpp
+               logger/logger.cpp common/sock_server.cpp
 SERVER_HDR  := common/constant.h tty/tty_server.h exec/exec_server.h exec/caps.h \
                exec/exec_loader.h loader/loader.h exec/exec_so.h exec/exec_types.h \
                exec/exec_qemu.h exec/exec_shebang.h \
                exec/exec_route.h exec/elf.h common/sock_server.h \
-               common/sock_operation.h
+               common/sock_operation.h logger/logger.h
 
 ifeq ($(MODE),warp)
   TARGET := $(DIST)/weston-terminal-wrap
