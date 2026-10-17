@@ -15,7 +15,7 @@
 # are compiled into the server; override them for an installed tree with
 #   -DIEC_FAKE_SYSROOT=... -DIEC_QEMU_DIR=...
 cmake_minimum_required(VERSION 3.16)
-project(iec VERSION 0.1.0 LANGUAGES C CXX)
+project(iec VERSION 0.1.0 LANGUAGES C CXX ASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -30,10 +30,19 @@ set(IEC_FAKE_SYSROOT "${CMAKE_CURRENT_SOURCE_DIR}/dist/fake_sysroot"
     CACHE PATH "Where absolute paths are rewritten when the PATH capability is 0")
 set(IEC_QEMU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/qemu"
     CACHE PATH "Directory holding libqemu-<guest>.so")
+set(IEC_PINNED_CAPS "01000"
+    CACHE STRING "Capability word pinned by main.cpp; e.g. 01032 to exercise kLoader")
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    set(IEC_GUEST_SWITCH loader/guest_switch_x86_64.S)
+else()
+    set(IEC_GUEST_SWITCH loader/guest_switch_aarch64.S)
+endif()
 
 set(IEC_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/common")
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_SOURCE_DIR}/loader")
 
 # ── caps ──────────────────────────────────────────────────────────────────
 # A separate object so the OHOS HAR can reuse it without pulling in either the
@@ -49,6 +58,9 @@ add_executable(iec_server
     main.cpp
     tty/tty_server.cpp
     exec/exec_server.cpp
+    exec/exec_loader.cpp
+    loader/loader.cpp
+    ${IEC_GUEST_SWITCH}
     exec/exec_so.cpp
     exec/exec_qemu.cpp
     exec/exec_shebang.cpp
@@ -58,6 +70,7 @@ add_executable(iec_server
 target_include_directories(iec_server PRIVATE ${IEC_INCLUDES})
 target_compile_definitions(iec_server PRIVATE
     _GNU_SOURCE
+    IEC_PINNED_CAPS=${IEC_PINNED_CAPS}
     "FAKE_SYSROOT=\"${IEC_FAKE_SYSROOT}\""
     "PATH_QEMU_X86_64_SO=\"${IEC_QEMU_DIR}/libqemu-x86_64.so\""
     "PATH_QEMU_AARCH64_SO=\"${IEC_QEMU_DIR}/libqemu-aarch64.so\"")

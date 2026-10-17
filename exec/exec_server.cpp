@@ -24,6 +24,7 @@
 #include "caps.h"
 #include "constant.h"
 #include "elf.h"
+#include "exec_loader.h"
 #include "exec_qemu.h"
 #include "exec_route.h"
 #include "exec_shebang.h"
@@ -397,6 +398,13 @@ void ClearInheritedSignalMask() {
                 if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
             }
             _exit(kExecFailedExit);
+        case LaunchKind::kLoader:
+            SpawnLoader(req);
+            {
+                static const char msg[] = "[exec] loader failed\n";
+                if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+            }
+            _exit(kExecFailedExit);
         case LaunchKind::kShebang:
             SpawnShebang(req);   /* returns for a script that cannot be followed */
             {
@@ -405,8 +413,8 @@ void ClearInheritedSignalMask() {
             }
             _exit(kExecFailedExit);
         default:
-            // kAuto is settled before this is reached, and kLoader and kUnexecutable have
-            // no router yet.
+            // kAuto is settled before this is reached, and kUnexecutable has no
+            // router.
             {
                 static const char msg[] = "[exec] launch kind unsupported\n";
                 if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}

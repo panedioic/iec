@@ -34,8 +34,18 @@ TREE_PATHS    := -DFAKE_SYSROOT=\"$(FAKE_SYSROOT)\" \
                  -DPATH_QEMU_X86_64_SO=\"$(QEMU_DIR)/libqemu-x86_64.so\" \
                  -DPATH_QEMU_AARCH64_SO=\"$(QEMU_DIR)/libqemu-aarch64.so\"
 
+# main.cpp pins this capability word. Override it to exercise other routes,
+# e.g. `make server PINNED_CAPS=01032` for fork=1, jit=3, path=2 (kLoader).
+PINNED_CAPS ?= 01000
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),x86_64)
+  GUEST_SWITCH_SRC := loader/guest_switch_x86_64.S
+else
+  GUEST_SWITCH_SRC := loader/guest_switch_aarch64.S
+endif
+
 CFLAGS   += -Wall -Icommon -D_GNU_SOURCE $(TREE_PATHS)
-CXXFLAGS += -Wall -Icommon -D_GNU_SOURCE $(TREE_PATHS)
+CXXFLAGS += -Wall -Icommon -Iloader -D_GNU_SOURCE -DIEC_PINNED_CAPS=$(PINNED_CAPS) $(TREE_PATHS)
 SHIM_SRC := tty/shim.c
 SHIM_HDR := common/constant.h common/intercept.h common/rpc.h common/sock_operation.h
 EXEC_SRC := exec/shim.c
@@ -56,10 +66,12 @@ WRAP_FLAGS := $(foreach s,$(SHIM_WRAPS),-Wl,--wrap=$(s))
 
 SERVER_BIN  := $(DIST)/iec_server
 SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp exec/caps.cpp \
+               exec/exec_loader.cpp loader/loader.cpp $(GUEST_SWITCH_SRC) \
                exec/exec_so.cpp exec/exec_qemu.cpp exec/exec_shebang.cpp exec/elf.cpp \
                common/sock_server.cpp
 SERVER_HDR  := common/constant.h tty/tty_server.h exec/exec_server.h exec/caps.h \
-               exec/exec_so.h exec/exec_types.h exec/exec_qemu.h exec/exec_shebang.h \
+               exec/exec_loader.h loader/loader.h exec/exec_so.h exec/exec_types.h \
+               exec/exec_qemu.h exec/exec_shebang.h \
                exec/exec_route.h exec/elf.h common/sock_server.h \
                common/sock_operation.h
 
