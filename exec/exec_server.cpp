@@ -31,6 +31,7 @@
 #include "exec_so.h"
 #include "exec_types.h"
 #include "logger/logger.h"
+#include "proc.h"
 
 struct SpawnResult {
     pid_t      pid = -1;
@@ -171,52 +172,6 @@ static bool ReplacesCaller(CallMethod method) {
     return false;
 }
 
-static bool ReadProcParentPid(pid_t pid, pid_t* out) {
-    char path[64];
-    char buf[1024];
-    const char* p;
-    char* end;
-    long ppid;
-
-    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    if (n < 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return false;
-    }
-    close(fd);
-    buf[n] = '\0';
-
-    p = strrchr(buf, ')');
-    if (p == nullptr || p[1] == '\0') {
-        errno = EINVAL;
-        return false;
-    }
-    // The line is "<pid> (<comm>) <state> <ppid> ...", so what has to be stepped
-    // over is the closing parenthesis, the spaces after it, the state (always one
-    // character) and the spaces after that -- and only then does the number start.
-    p++;
-    while (*p == ' ') p++;
-    if (*p == '\0') {
-        errno = EINVAL;
-        return false;
-    }
-    p++;                                   // the state field
-    while (*p == ' ') p++;
-    errno = 0;
-    ppid = strtol(p, &end, 10);
-    if (end == p || ppid <= 0) {
-        errno = EINVAL;
-        return false;
-    }
-    *out = static_cast<pid_t>(ppid);
-    return true;
-}
-
 // The pid to record as the parent of the program a request asks for.
 //
 // An exec replaces the caller, so the program belongs where the caller was: under
@@ -229,7 +184,8 @@ static pid_t ParentPidFor(const SpawnRequest& req) {
 
     if (!ReplacesCaller(req.call_method)) return req.caller_pid;
 
-    if (ReadProcParentPid(req.caller_pid, &ppid)) return ppid;
+    ppid = iec_parent_pid(req.caller_pid);
+    if (ppid > 0) return ppid;
 
     // The caller can be gone by now: a stand-in that was killed outright, or one
     // whose exec raced its own exit. There is no parent to name in that case, and
@@ -238,8 +194,8 @@ static pid_t ParentPidFor(const SpawnRequest& req) {
     // it is at least the process the request came from -- and it is reported, so
     // that a table full of entries filed under a dead pid is not a silent thing.
     Logger::GetInstance()->LogW(
-        "[exec] no parent for caller %d: %s; recording the caller as the parent",
-        (int)req.caller_pid, strerror(errno));
+        "[exec] no parent for caller %d; recording the caller as the parent",
+        (int)req.caller_pid);
     return req.caller_pid;
 }
 
