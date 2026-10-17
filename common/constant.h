@@ -20,6 +20,7 @@
 #define PATH_QEMU_AARCH64_SO    "/data/storage/el1/bundle/libs/arm64/libqemu-aarch64.so"
 #define FAKE_SYSROOT            "/data/storage/el2/base/files"
 #define IEC_LOG_DIR             "/data/storage/el2/base/files/logs"
+#define IEC_DEFAULT_HOME        "/data/storage/el2/base/files/home"
 
 #endif
 
@@ -65,4 +66,11 @@
 
 #ifndef FAKE_SYSROOT
 #define FAKE_SYSROOT "/workspace/dev/iec/dist/fake_sysroot"
+#endif
+
+/* The runtime home, when the host does not export one. On OHOS it is the
+ * application's own home under the fake root; a host build keeps it under the
+ * fake sysroot next to the launchers. */
+#ifndef IEC_DEFAULT_HOME
+#define IEC_DEFAULT_HOME FAKE_SYSROOT "/home"
 #endif
