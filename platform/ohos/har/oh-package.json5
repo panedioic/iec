@@ -1,7 +1,7 @@
 {
   "name": "iec",
   "version": "1.0.0",
-  "description": "Smoke-test HAR: exposes a C++ NAPI hello()",
+  "description": "IEC runtime HAR.",
   "main": "Index.ets",
   "author": "",
   "license": "",

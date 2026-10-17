@@ -1,5 +1,5 @@
-// Public ArkTS entry of the HAR: re-export the native hello() and the
-// capability wrappers so consumers can `import { ... } from 'iec'`.
-import { hello, setCaps, probeCaps } from 'libiec_server.so';
+// Public ArkTS entry of the HAR: re-export the capability probes and the
+// lifecycle of the tty/exec services so consumers can `import { ... } from 'iec'`.
+import { hello, setCaps, probeCaps, startIecServer, stopIecServer } from 'libiec_server.so';
 
-export { hello, setCaps, probeCaps };
+export { hello, setCaps, probeCaps, startIecServer, stopIecServer };
