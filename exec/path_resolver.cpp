@@ -1,9 +1,10 @@
 // exec/path_resolver.cpp — where a requested program is looked up.
 //
 // These two functions answer "what does this path mean on this host?":
-// UnderFakeRoot rewrites an absolute path into the fake root when the PATH
-// capability says only the app sandbox is reachable; ResolveFilePath applies
-// POSIX PATH search to a bare name. Both are declared in exec_route.h.
+// UnderFakeRoot rewrites the system bin prefixes of an absolute path into the
+// fake root when the PATH capability says only the app sandbox is reachable;
+// ResolveFilePath applies POSIX PATH search to a bare name. Both are declared
+// in exec_route.h.
 #include "exec_route.h"
 
 #include "caps.h"
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -42,11 +44,25 @@ std::string PathForRequest(const std::vector<std::string>& env) {
     return fallback;
 }
 
+const char* const kSysBins[] = {
+    "/bin/", "/usr/bin/", "/usr/local/bin/", "/sbin/", "/usr/sbin/",
+    "/system/bin/", "/vendor/bin/", "/system/lib/", "/data/app/bin/",
+};
+
+bool StartsWithSystemBin(const std::string& path) {
+    for (const char* dir : kSysBins) {
+        const size_t n = strlen(dir);
+        if (path.size() >= n && path.compare(0, n, dir) == 0) return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 std::string UnderFakeRoot(const std::string& path) {
     if (Caps().path != 0) return path;
     if (path.empty() || path[0] != '/') return path;
+    if (!StartsWithSystemBin(path)) return path;
     return std::string(FAKE_SYSROOT) + path;
 }
 
