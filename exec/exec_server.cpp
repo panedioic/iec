@@ -64,6 +64,48 @@ struct ProcessInfo {
 // on that thread, or the first thing it needs is a mutex.
 static std::unordered_map<pid_t, ProcessInfo> procmap;
 
+// The caller runs in a child forked from this server, so /proc/self/exe in it
+// names the server rather than the program the caller really is. 
+static const std::string& ServerExePath() {
+    static const std::string path = [] {
+        char buf[4096];
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+        if (n <= 0) return std::string();
+        buf[n] = '\0';
+        return std::string(buf);
+    }();
+    return path;
+}
+
+static bool IsServerSelfPath(const std::string& path) {
+    if (path == "/proc/self/exe") return true;
+    const std::string& self = ServerExePath();
+    return !self.empty() && path == self;
+}
+
+static bool ResolveSelfPath(std::string* path, pid_t caller) {
+    if (!IsServerSelfPath(*path)) return false;
+
+    const ProcessInfo* best = nullptr;
+    for (const auto& kv : procmap) {
+        const ProcessInfo& info = kv.second;
+        if (info.standin_pid != caller || info.cmd.empty()) continue;
+        if (best == nullptr ||
+            (info.alive && !best->alive) ||
+            (info.alive == best->alive && info.start_time_ms > best->start_time_ms))
+            best = &info;
+    }
+
+    if (best == nullptr) {
+        auto it = procmap.find(caller);
+        if (it != procmap.end() && !it->second.cmd.empty()) best = &it->second;
+    }
+
+    if (best == nullptr || best->cmd == *path) return false;
+    *path = best->cmd;
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Resolver                                                           */
 /* ------------------------------------------------------------------ */
@@ -634,12 +676,18 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     if (!next("cwd", cwd)) return false;
     sr.cwd = cwd;
     sr.sid = 0; // todo: multisession in future.
+
+    const bool self_path = ResolveSelfPath(&file, sr.caller_pid);
+    if (self_path)
+        fprintf(stderr, "[exec] self path -> %s (caller %d)\n",
+                file.c_str(), (int)sr.caller_pid);
+
     // Every request passes through here, whatever member of the family sent it, which is
     // why the fake root is applied at this point rather than inside the path search. That
     // search is only reached by the three calls whose names end in p, and the calls that
     // name an absolute path -- the shell a terminal starts, for one -- never go near it.
     // Logged after this, so what the log shows is what will be started.
-    file = UnderFakeRoot(file);
+    if (!self_path) file = UnderFakeRoot(file);
     // The remaining fields keep their defaults: sync_wait is true (a foreground
     // command on a terminal always waits), and no process name is carried by the
     // request yet.
