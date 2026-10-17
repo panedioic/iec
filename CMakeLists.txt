@@ -88,6 +88,8 @@ add_library(iec_preload SHARED
     tty/shim.c
     exec/shim.c
     fs/shim.c
+    misc/getpass.c
+    misc/account.c
     common/rpc.c
     common/sock_client.c)
 
