@@ -68,65 +68,6 @@ static std::unordered_map<pid_t, ProcessInfo> procmap;
 /* Resolver                                                           */
 /* ------------------------------------------------------------------ */
 
-static bool IsExecutableFile(const std::string& path) {
-    struct stat st;
-
-    if (stat(path.c_str(), &st) != 0) return false;
-    if (!S_ISREG(st.st_mode)) return false;
-    return access(path.c_str(), X_OK) == 0;
-}
-
-static std::string PathForRequest(const std::vector<std::string>& env) {
-    for (const std::string& e : env)
-        if (e.compare(0, 5, "PATH=") == 0) return e.substr(5);
-
-    if (const char* own = getenv("PATH")) return own;
-    
-    std::string fallback;
-    size_t n = confstr(_CS_PATH, nullptr, 0);
-    if (n > 0) {
-        fallback.resize(n);
-        confstr(_CS_PATH, &fallback[0], n);
-        if (fallback.back() == '\0') fallback.pop_back();
-    }
-    return fallback;
-}
-
-// Where a path is looked up when the host says only the app sandbox is reachable: the real
-// root is not there, so an absolute path means one inside the fake root. A relative path
-// is left alone, being relative to a working directory, and the empty string stays empty,
-// which is what keeps the "an empty PATH entry means the working directory" rule below
-// working.
-std::string UnderFakeRoot(const std::string& path) {
-    if (Caps().path != 0) return path;
-    if (path.empty() || path[0] != '/') return path;
-    return std::string(FAKE_SYSROOT) + path;
-}
-
-std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env,
-                            const std::string& cwd) {
-    if (path.find('/') != std::string::npos) return path;
-
-    const std::string dirs = PathForRequest(env);
-    size_t start = 0;
-
-    for (;;) {
-        const size_t colon = dirs.find(':', start);
-        const size_t end = colon == std::string::npos ? dirs.size() : colon;
-        const std::string dir = dirs.substr(start, end - start);
-        // The search runs in the root the program will be started in, which is the fake
-        // one where only the sandbox is reachable, so an absolute entry means inside it.
-        const std::string in_root = UnderFakeRoot(dir);
-        const std::string candidate =
-            in_root.empty() ? (cwd.empty() ? path : cwd + "/" + path) : in_root + "/" + path;
-
-        if (IsExecutableFile(candidate)) return candidate;
-        if (colon == std::string::npos) break;
-        start = colon + 1;
-    }
-    return std::string();
-}
-
 LaunchKind ResolveKind(const std::string& path) {
     const HostCapabilities& caps = Caps();
 

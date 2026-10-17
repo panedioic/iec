@@ -65,7 +65,7 @@ SHIM_WRAPS := open close dup dup2 dup3 fcntl ioctl isatty ttyname \
 WRAP_FLAGS := $(foreach s,$(SHIM_WRAPS),-Wl,--wrap=$(s))
 
 SERVER_BIN  := $(DIST)/iec_server
-SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp exec/caps.cpp \
+SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp exec/path_resolver.cpp exec/caps.cpp \
                exec/exec_loader.cpp loader/loader.cpp $(GUEST_SWITCH_SRC) \
                exec/exec_so.cpp exec/exec_qemu.cpp exec/exec_shebang.cpp exec/elf.cpp \
                common/sock_server.cpp
