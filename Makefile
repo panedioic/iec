@@ -50,6 +50,8 @@ SHIM_SRC := tty/shim.c
 SHIM_HDR := common/constant.h common/intercept.h common/rpc.h common/sock_operation.h
 EXEC_SRC := exec/shim.c
 EXEC_HDR := common/constant.h common/intercept.h common/rpc.h
+FS_SRC   := fs/shim.c
+FS_HDR   := common/constant.h common/intercept.h
 SOCK_SRC := common/sock_client.c
 SOCK_HDR := common/sock_client.h
 RPC_SRC  := common/rpc.c
@@ -114,8 +116,8 @@ $(BUILD)/sock_client.o: $(SOCK_SRC) $(SOCK_HDR) | $(BUILD)
 $(BUILD)/rpc.o: $(RPC_SRC) $(RPC_HDR) $(SOCK_HDR) | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
-$(DIST)/libiec.so: $(SHIM_SRC) $(EXEC_SRC) $(RPC_SRC) $(SHIM_HDR) $(EXEC_HDR) $(RPC_HDR) $(SOCK_SRC) $(SOCK_HDR) | $(DIST)
-	$(CC) $(CFLAGS) -DINT_PRELOAD -shared -fPIC $(SHIM_SRC) $(EXEC_SRC) $(RPC_SRC) $(SOCK_SRC) -o $@ -ldl
+$(DIST)/libiec.so: $(SHIM_SRC) $(EXEC_SRC) $(FS_SRC) $(RPC_SRC) $(SHIM_HDR) $(EXEC_HDR) $(FS_HDR) $(RPC_HDR) $(SOCK_SRC) $(SOCK_HDR) | $(DIST)
+	$(CC) $(CFLAGS) -DINT_PRELOAD -DIEC_SHIM_MERGED_OPEN -shared -fPIC $(SHIM_SRC) $(EXEC_SRC) $(FS_SRC) $(RPC_SRC) $(SOCK_SRC) -o $@ -ldl
 
 # --wrap only takes effect at link time and does nothing for an already-built executable, so the shim must be relinked together with the client
 $(DIST)/weston-terminal-wrap: $(BUILD)/shim_tty.o $(BUILD)/exec_shim.o $(BUILD)/sock_client.o $(BUILD)/rpc.o scripts/build_client.sh | $(DIST)

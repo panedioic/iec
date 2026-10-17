@@ -312,6 +312,11 @@ static int pts_setwinsz(int pts_n, const struct winsize *ws) {
 /* Hooks                                                               */
 /* ------------------------------------------------------------------ */
 
+/* Provided by the fs shim (preload build): resolve simulated symlinks before
+ * the real open. Weak so builds without that module simply skip it. */
+extern int iec_fs_do_open(int dirfd, const char* path, int flags, mode_t mode)
+    __attribute__((weak));
+
 int IEC_EXPORT(open)(const char *path, int flags, ...) {
     uint32_t pts_n = 0;
     int fd;
@@ -350,7 +355,19 @@ int IEC_EXPORT(open)(const char *path, int flags, ...) {
         return fd;
     }
 
-    /* Not a pty path: let the real open() have it. */
+    /* Not a pty path: let the fs shim resolve simulated symlinks first. */
+    if (iec_fs_do_open) {
+        mode_t mode = 0;
+        if (flags & O_CREAT) {
+            va_list ap;
+            va_start(ap, flags);
+            mode = (mode_t)va_arg(ap, int);
+            va_end(ap);
+        }
+        return iec_fs_do_open(AT_FDCWD, path, flags, mode);
+    }
+
+    /* No fs shim in this build: let the real open() have it. */
     RESOLVE(real_open, open);
     if (flags & O_CREAT) {
         va_list ap;

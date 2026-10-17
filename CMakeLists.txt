@@ -79,17 +79,21 @@ target_compile_options(iec_server PRIVATE -Wall)
 target_link_libraries(iec_server PRIVATE iec_caps dl pthread)
 
 # ── preload shim ──────────────────────────────────────────────────────────
-# tty/shim.c and exec/shim.c are the two halves of the client side; rpc.c and
-# sock_client.c are shared by both, and must be compiled in: an LD_PRELOAD
-# object cannot expect the host to provide them.
+# tty/shim.c, exec/shim.c and fs/shim.c are the client side; rpc.c and
+# sock_client.c are shared by all of them, and must be compiled in: an
+# LD_PRELOAD object cannot expect the host to provide them.
 add_library(iec_preload SHARED
     tty/shim.c
     exec/shim.c
+    fs/shim.c
     common/rpc.c
     common/sock_client.c)
 
 target_include_directories(iec_preload PRIVATE ${IEC_INCLUDES})
-target_compile_definitions(iec_preload PRIVATE INT_PRELOAD _GNU_SOURCE)
+target_compile_definitions(iec_preload PRIVATE
+    INT_PRELOAD
+    IEC_SHIM_MERGED_OPEN
+    _GNU_SOURCE)
 target_compile_options(iec_preload PRIVATE -Wall)
 target_link_libraries(iec_preload PRIVATE dl)
 
