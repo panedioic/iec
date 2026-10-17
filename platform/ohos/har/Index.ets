@@ -1,5 +1,5 @@
-// Public ArkTS entry of the HAR: re-export the native hello() so consumers can
-// `import { hello } from 'iec'`.
-import { hello } from 'libiec_server.so';
+// Public ArkTS entry of the HAR: re-export the native hello() and the
+// capability wrappers so consumers can `import { ... } from 'iec'`.
+import { hello, setCaps, probeCaps } from 'libiec_server.so';
 
-export { hello };
+export { hello, setCaps, probeCaps };

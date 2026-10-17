@@ -35,12 +35,20 @@ set(IEC_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/common")
 
+# ── caps ──────────────────────────────────────────────────────────────────
+# A separate object so the OHOS HAR can reuse it without pulling in either the
+# server or the preload shim.
+add_library(iec_caps STATIC exec/caps.cpp)
+target_include_directories(iec_caps PUBLIC ${IEC_INCLUDES})
+target_compile_definitions(iec_caps PRIVATE _GNU_SOURCE)
+target_compile_options(iec_caps PRIVATE -Wall)
+set_target_properties(iec_caps PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # ── server ────────────────────────────────────────────────────────────────
 add_executable(iec_server
     main.cpp
     tty/tty_server.cpp
     exec/exec_server.cpp
-    exec/caps.cpp
     exec/exec_so.cpp
     exec/exec_qemu.cpp
     exec/exec_shebang.cpp
@@ -54,7 +62,7 @@ target_compile_definitions(iec_server PRIVATE
     "PATH_QEMU_X86_64_SO=\"${IEC_QEMU_DIR}/libqemu-x86_64.so\""
     "PATH_QEMU_AARCH64_SO=\"${IEC_QEMU_DIR}/libqemu-aarch64.so\"")
 target_compile_options(iec_server PRIVATE -Wall)
-target_link_libraries(iec_server PRIVATE dl pthread)
+target_link_libraries(iec_server PRIVATE iec_caps dl pthread)
 
 # ── preload shim ──────────────────────────────────────────────────────────
 # tty/shim.c and exec/shim.c are the two halves of the client side; rpc.c and
