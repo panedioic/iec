@@ -8,11 +8,10 @@
 //
 // written as four octal digits. 0o1232 therefore means fork=1, exec=2, jit=3,
 // path=2; 0o1000 means fork=1 and everything else zero. (C++ spells those
-// 01232 and 01000 -- it has no 0o prefix; 0o is this comment's notation, and
-// the form IEC_CAPS accepts.) The packing exists so the whole answer can be
-// written down as one number -- logged at start-up, overridden from the
-// environment, or carried in a bug report -- without a struct having to travel
-// with it.
+// 01232 and 01000 -- it has no 0o prefix; 0o is this comment's notation.) The
+// packing exists so the whole answer can be written down as one number --
+// logged at start-up, or carried in a bug report -- without a struct having to
+// travel with it.
 #pragma once
 
 #include <cstdint>
@@ -50,10 +49,7 @@ HostCapabilities UnpackCaps(uint64_t cap);
 // explicit set has run.
 const HostCapabilities& Caps();
 
-// Probes the host and returns the packed word. A non-empty IEC_CAPS in the
-// environment takes precedence over probing. Accepts either the packed number
-// in octal (0o1232, 01232 and 1232 all mean the same) or four comma-separated
-// digits in the order fork,exec,jit,path.
+// Probes the host and returns the packed word.
 uint64_t ProbeCapabilities();
 
 // Compatibility with the earlier signature: probe and write the word out.

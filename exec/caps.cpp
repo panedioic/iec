@@ -318,41 +318,11 @@ static int ProbeJit() {
     return 0;
 }
 
+}  // namespace
+
 /* ------------------------------------------------------------------ */
 /* the packed word                                                    */
 /* ------------------------------------------------------------------ */
-
-// Either "fork,exec,jit,path" (decimal digits, each 0..7) or one packed number
-// in octal: 0o1232, 01232 and 1232 are the same value.
-static bool ParseCaps(const char* s, HostCapabilities* out) {
-    if (s == nullptr || *s == '\0') return false;
-
-    int fork = -1, exec = -1, jit = -1, path = -1;
-    if (sscanf(s, "%d,%d,%d,%d", &fork, &exec, &jit, &path) == 4) {
-        if (fork < 0 || fork > 7 || exec < 0 || exec > 7 ||
-            jit < 0 || jit > 7 || path < 0 || path > 7)
-            return false;
-        out->fork = fork;
-        out->exec = exec;
-        out->jit = jit;
-        out->path = path;
-        return true;
-    }
-
-    // C++'s 0o prefix is not something strtoull knows, so step over it by hand;
-    // a leading 0 without the o is already octal to strtoull.
-    const char* digits = s;
-    if (s[0] == '0' && (s[1] == 'o' || s[1] == 'O')) digits = s + 2;
-
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long v = strtoull(digits, &end, 8);
-    if (errno != 0 || end == digits || *end != '\0') return false;
-    *out = UnpackCaps(static_cast<uint64_t>(v));
-    return true;
-}
-
-}  // namespace
 
 uint64_t PackCaps(const HostCapabilities& caps) {
     return (static_cast<uint64_t>(caps.fork & kCapMask) << kCapForkShift) |
