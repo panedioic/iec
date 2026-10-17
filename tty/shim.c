@@ -322,6 +322,29 @@ int IEC_EXPORT(open)(const char *path, int flags, ...) {
     int fd;
 
     /* open() is declared __nonnull, so path is never NULL here. */
+    if (strcmp(path, "/dev/tty") == 0) {
+        const char *env = getenv(IEC_TTY_ENV);
+        int n = (env && *env >= '0' && *env <= '9') ? atoi(env) : -1;
+        int local = (n >= 0) ? fd_for_pts(n, 0) : -1;
+
+        if (local < 0) {
+            int i;
+            for (i = 0; i < SHIM_MAX_FD; i++) {
+                if (g_fd[i].state != kFdOurs || g_fd[i].is_master) continue;
+                local = i;
+                n = g_fd[i].pts_n;
+                break;
+            }
+        }
+        if (local < 0) {
+            errno = ENXIO;
+            return -1;
+        }
+        fd = dup(local);
+        if (fd < 0) return -1;
+        tty_set(fd, n, 0);
+        return fd;
+    }
     if (strcmp(path, PTMX_PATH) == 0) {
         fd = rpc_take_fd(OP_OPENPTMX, NULL, 0, &pts_n);
         if (fd < 0) return -1;
