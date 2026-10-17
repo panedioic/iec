@@ -359,6 +359,14 @@ void ClearInheritedSignalMask() {
     sigprocmask(SIG_SETMASK, &empty, nullptr);
 }
 
+void ApplyRequestEnvironment(const SpawnRequest& req) {
+    for (const std::string& entry : req.env) {
+        const size_t eq = entry.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        setenv(entry.substr(0, eq).c_str(), entry.substr(eq + 1).c_str(), 1);
+    }
+}
+
 [[noreturn]] void StartByKind(LaunchKind kind, const SpawnRequest& req) {
     switch (kind) {
         case LaunchKind::kExec:
@@ -451,6 +459,9 @@ SpawnResult Spawn(const SpawnRequest& req) {
             if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
             _exit(kExecFailedExit);
         }
+        // Constructors in an object started below (tty/shim.c is one) read the
+        // caller's environment, so it has to be in place before StartByKind.
+        ApplyRequestEnvironment(req);
         // In order to facilitate the reuse of logic in SpawnShebang, the routing 
         // for the "kind" will be extracted separately as a function here.
         StartByKind(res.kind, req);
@@ -715,6 +726,21 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
         if (!next("env", e)) return false;
         Logger::GetInstance()->LogI("[exec]   env[%u] = %s", i, e.c_str());
         sr.env.push_back(e);
+    }
+
+    // The client-side fs shim maps absolute paths (including the PATH entries a
+    // shell stats before exec) relative to this root. A real execve() replaces
+    // the environment with sr.env, and the shared-object route installs sr.env
+    // in the child, so the root has to travel with the request rather than be
+    // set only in the server's own process.
+    bool has_iec_root = false;
+    const std::string iec_root = std::string("IEC_SYSROOT=") + FAKE_SYSROOT;
+    for (const std::string& e : sr.env) {
+        if (e.compare(0, 12, "IEC_SYSROOT=") == 0) { has_iec_root = true; break; }
+    }
+    if (!has_iec_root) {
+        sr.env.push_back(iec_root);
+        Logger::GetInstance()->LogI("[exec]   env[] = %s (added)", iec_root.c_str());
     }
     if (off != n)
         Logger::GetInstance()->LogW("[exec] %zu trailing bytes ignored", n - off);
