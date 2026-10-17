@@ -59,6 +59,7 @@ add_executable(iec_server
     tty/tty_server.cpp
     exec/exec_server.cpp
     exec/path_resolver.cpp
+    fs/resolver.c
     exec/exec_loader.cpp
     loader/loader.cpp
     ${IEC_GUEST_SWITCH}

@@ -9,6 +9,7 @@
 
 #include "caps.h"
 #include "constant.h"
+#include "fs/resolver.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -57,13 +58,57 @@ bool StartsWithSystemBin(const std::string& path) {
     return false;
 }
 
+struct MapSet {
+    std::vector<std::string> to;
+    std::vector<iec_map_t> maps;
+};
+
+// The fake-root mapping table: each system bin prefix maps to the same path
+// under FAKE_SYSROOT. The strings live in `to`, which is not modified after the
+// table is built, so the pointers in `maps` stay valid.
+const MapSet& FakeRootMaps() {
+    static const MapSet set = [] {
+        MapSet s;
+        const size_t n = sizeof(kSysBins) / sizeof(kSysBins[0]);
+        s.to.reserve(n);
+        s.maps.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            s.to.emplace_back(std::string(FAKE_SYSROOT) + kSysBins[i]);
+            s.maps[i].from = kSysBins[i];
+            s.maps[i].to = s.to.back().c_str();
+        }
+        return s;
+    }();
+    return set;
+}
+
+// Resolve simulated symlinks (.IEC_SYMLINK markers) and apply the fake-root
+// maps. A path that the resolver cannot resolve is returned unchanged so the
+// caller can report the original name.
+std::string ResolveSimulated(const std::string& path, const std::string& cwd) {
+    iec_opts_t opts{};
+    if (Caps().path == 0) {
+        const MapSet& maps = FakeRootMaps();
+        opts.maps = maps.maps.data();
+        opts.nmaps = maps.maps.size();
+    }
+    opts.cwd = cwd.empty() ? nullptr : cwd.c_str();
+    opts.max_links = 40;
+
+    char out[4096];
+    const int rc = iec_resolve_path(path.c_str(), &opts, out, sizeof out);
+    return rc == 0 ? std::string(out) : path;
+}
+
 }  // namespace
 
 std::string UnderFakeRoot(const std::string& path) {
     if (Caps().path != 0) return path;
     if (path.empty() || path[0] != '/') return path;
-    if (!StartsWithSystemBin(path)) return path;
-    return std::string(FAKE_SYSROOT) + path;
+
+    const std::string mapped =
+        StartsWithSystemBin(path) ? std::string(FAKE_SYSROOT) + path : path;
+    return ResolveSimulated(mapped, "");
 }
 
 std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env,
@@ -83,7 +128,8 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
         const std::string candidate =
             in_root.empty() ? (cwd.empty() ? path : cwd + "/" + path) : in_root + "/" + path;
 
-        if (IsExecutableFile(candidate)) return candidate;
+        const std::string resolved = ResolveSimulated(candidate, cwd);
+        if (IsExecutableFile(resolved)) return resolved;
         if (colon == std::string::npos) break;
         start = colon + 1;
     }
