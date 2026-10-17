@@ -2,7 +2,9 @@
 # Intermediate objects, plus the generated protocols/ and config.h written by
 # scripts/build_client.sh
 /build/
-# Final artifacts: libiec.so, weston-terminal-wrap, iec_server
+# CMake's out-of-source test build (see CMakeLists.txt)
+/build-cmake/
+# Final artifacts: libiec.so, libiec_preload.so, weston-terminal-wrap, iec_server
 /dist/
 
 # ---- Prebuilt client binary ----
