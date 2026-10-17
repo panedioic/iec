@@ -150,8 +150,16 @@ void initTermios(Pty& e) {
     // 0 baud is not what a program opening a pty expects to find.
     e.tio.c_cflag = CS8 | CREAD | CLOCAL | B38400;
     e.tio.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
+    // OHOS's musl fork keeps the speed fields under reserved names; the values
+    // are not interpreted here, but a pty that reports 0 baud is not what a
+    // program opening one expects.
+#if defined(__OHOS__)
+    e.tio.__c_ispeed = B38400;
+    e.tio.__c_ospeed = B38400;
+#else
     e.tio.c_ispeed = B38400;
     e.tio.c_ospeed = B38400;
+#endif
     e.tio.c_cc[VMIN] = 1;
     e.tio.c_cc[VTIME] = 0;
     // The control characters matter as much as the flags: a zeroed struct would
