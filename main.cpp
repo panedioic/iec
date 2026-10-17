@@ -4,6 +4,7 @@
 #include <exception>
 
 #include "common/constant.h"
+#include "exec/caps.h"
 #include "exec/exec_server.h"
 #include "tty/tty_server.h"
 
@@ -25,6 +26,11 @@ int main(int argc, char** argv) {
     // the tty path comes first and the exec path second.
     const char* tty_path  = argc > 1 ? argv[1] : TTY_SOCK_PATH;
     const char* exec_path = argc > 2 ? argv[2] : EXEC_SOCK_PATH;
+
+    // C++ has no 0o prefix: 01000 is the octal 1000 the caps are packed in,
+    // meaning fork=1 and exec=jit=path=0.
+    setCaps(01000);
+
     try {
         TtyServer tty_srv(tty_path);
         ExecServer exec_srv(exec_path);

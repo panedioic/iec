@@ -24,8 +24,18 @@ WESTON_SRC ?= /workspace/dev/weston
 DIST  := dist
 BUILD := build
 
-CFLAGS   += -Wall -Icommon -D_GNU_SOURCE
-CXXFLAGS += -Wall -Icommon -D_GNU_SOURCE
+# The defaults in common/constant.h are absolute paths from the tree this was
+# first built in. A checkout elsewhere would inherit those, so the Makefile --
+# which knows where it is -- supplies this tree's paths instead. Override
+# FAKE_SYSROOT/QEMU_DIR on the command line to point at an installed tree.
+QEMU_DIR      := $(CURDIR)/$(DIST)/qemu
+FAKE_SYSROOT  := $(CURDIR)/$(DIST)/fake_sysroot
+TREE_PATHS    := -DFAKE_SYSROOT=\"$(FAKE_SYSROOT)\" \
+                 -DPATH_QEMU_X86_64_SO=\"$(QEMU_DIR)/libqemu-x86_64.so\" \
+                 -DPATH_QEMU_AARCH64_SO=\"$(QEMU_DIR)/libqemu-aarch64.so\"
+
+CFLAGS   += -Wall -Icommon -D_GNU_SOURCE $(TREE_PATHS)
+CXXFLAGS += -Wall -Icommon -D_GNU_SOURCE $(TREE_PATHS)
 SHIM_SRC := tty/shim.c
 SHIM_HDR := common/constant.h common/intercept.h common/rpc.h common/sock_operation.h
 EXEC_SRC := exec/shim.c
@@ -45,11 +55,11 @@ SHIM_WRAPS := open close dup dup2 dup3 fcntl ioctl isatty ttyname \
 WRAP_FLAGS := $(foreach s,$(SHIM_WRAPS),-Wl,--wrap=$(s))
 
 SERVER_BIN  := $(DIST)/iec_server
-SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp exec/exec_so.cpp \
-               exec/exec_qemu.cpp exec/exec_shebang.cpp exec/elf.cpp \
+SERVER_SRCS := main.cpp tty/tty_server.cpp exec/exec_server.cpp exec/caps.cpp \
+               exec/exec_so.cpp exec/exec_qemu.cpp exec/exec_shebang.cpp exec/elf.cpp \
                common/sock_server.cpp
-SERVER_HDR  := common/constant.h tty/tty_server.h exec/exec_server.h exec/exec_so.h \
-               exec/exec_types.h exec/exec_qemu.h exec/exec_shebang.h \
+SERVER_HDR  := common/constant.h tty/tty_server.h exec/exec_server.h exec/caps.h \
+               exec/exec_so.h exec/exec_types.h exec/exec_qemu.h exec/exec_shebang.h \
                exec/exec_route.h exec/elf.h common/sock_server.h \
                common/sock_operation.h
 

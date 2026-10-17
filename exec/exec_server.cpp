@@ -21,6 +21,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "caps.h"
 #include "constant.h"
 #include "elf.h"
 #include "exec_qemu.h"
@@ -54,30 +55,6 @@ struct ProcessInfo {
     // raw word alone cannot be read at a glance in a log; nothing branches on it.
     int         exit_code = -1;
 };
-
-struct HostCapabilities {
-    /* FORK Probe
-     * 0: fork is unavailable on this device. 
-     * 1: fork available. */
-    int fork = 0;
-    /* EXEC Probe
-     * 0: exec is unavailable on this device. 
-     * 1: exec is available in specific directories (i.e. /bin/sh), but unavailable in other path.
-     * 2: exec is available */
-    int exec = 0;
-    /* JIT Probe
-     * 0: None of the methods are applicable. Only qemu simulation can be used. 
-     * 1: JIT can be achieved through the mprotect method. 
-     * 2: memfd. 
-     * 3: anon-rwx.*/
-    int jit = 0;
-    /* PATH Probe
-     * 0: only app sandbox is reachable. 
-     * 1: part of the system path (i.e. /bin/sh) is reachable.
-     * 2: full-disk is reachable */
-    int path = 0;
-};
-static HostCapabilities g_caps = {1, 0, 0, 0};
 
 // Every child this server started, keyed by pid. The spawn path writes it, and the
 // request handlers (onWait, onSignal) read it alongside the reaper in onTick().
@@ -120,7 +97,7 @@ static std::string PathForRequest(const std::vector<std::string>& env) {
 // which is what keeps the "an empty PATH entry means the working directory" rule below
 // working.
 std::string UnderFakeRoot(const std::string& path) {
-    if (g_caps.path != 0) return path;
+    if (Caps().path != 0) return path;
     if (path.empty() || path[0] != '/') return path;
     return std::string(FAKE_SYSROOT) + path;
 }
@@ -150,15 +127,17 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
 }
 
 LaunchKind ResolveKind(const std::string& path) {
-    if (g_caps.fork == 1 && ReadShebang(path))  return LaunchKind::kShebang;
-    if (g_caps.fork == 1 && IsSoLauncher(path)) return LaunchKind::kSo;
+    const HostCapabilities& caps = Caps();
+
+    if (caps.fork == 1 && ReadShebang(path))  return LaunchKind::kShebang;
+    if (caps.fork == 1 && IsSoLauncher(path)) return LaunchKind::kSo;
 
     const uint16_t machine = ElfMachine(path);
     const bool host_arch = machine == HOST_ARCH;
 
-    if (host_arch && g_caps.fork == 1) {
-        if (g_caps.exec == 2) return LaunchKind::kExec;
-        if (g_caps.jit > 0) return LaunchKind::kLoader;
+    if (host_arch && caps.fork == 1) {
+        if (caps.exec == 2) return LaunchKind::kExec;
+        if (caps.jit > 0) return LaunchKind::kLoader;
     }
 
     if (machine == EM_AARCH64) return LaunchKind::kQemu_aarch64;
