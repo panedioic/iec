@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <utility>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -92,6 +93,14 @@ void Logger::LogV(int level, const char* fmt, va_list ap) {
         fflush(stderr);
     }
 
+    if (custom_writer_) {
+        try {
+            custom_writer_(level, tagged);
+        } catch (...) {
+            // A sink must not take the process down.
+        }
+    }
+
     if (log_file_ && !file_path_.empty()) {
         const size_t slash = file_path_.find_last_of('/');
         if (slash != std::string::npos) {
@@ -106,6 +115,11 @@ void Logger::LogV(int level, const char* fmt, va_list ap) {
 
 void Logger::SetStderr(bool on) { std::lock_guard<std::mutex> lk(mu_); log_stderr_ = on; }
 void Logger::SetFile(bool on)   { std::lock_guard<std::mutex> lk(mu_); log_file_ = on; }
+
+void Logger::SetCustomWriter(CustomWriter writer) {
+    std::lock_guard<std::mutex> lk(mu_);
+    custom_writer_ = std::move(writer);
+}
 
 bool Logger::StderrEnabled() const { std::lock_guard<std::mutex> lk(mu_); return log_stderr_; }
 bool Logger::FileEnabled() const   { std::lock_guard<std::mutex> lk(mu_); return log_file_; }

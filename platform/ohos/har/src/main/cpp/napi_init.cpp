@@ -5,7 +5,18 @@
 // uses.
 #include <napi/native_api.h>
 
+/* OH_LOG_INFO uses these two when it is expanded; without them the default
+ * domain is 0 and the tag is NULL, which is not a useful hilog record. */
+#ifndef LOG_DOMAIN
+#define LOG_DOMAIN 0x0000
+#endif
+#ifndef LOG_TAG
+#define LOG_TAG "IEC_LOGGER"
+#endif
+#include <hilog/log.h>
+
 #include "exec/caps.h"
+#include "logger/logger.h"
 
 namespace {
 
@@ -70,6 +81,18 @@ napi_value ProbeCaps(napi_env env, napi_callback_info /*info*/) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
+    // The logger has no OHOS dependency of its own. Register hilog as a custom
+    // sink here, where the NAPI/hilog libraries are already linked.
+    Logger::GetInstance()->SetCustomWriter([](int level, const std::string& line) {
+        if (level >= 2) {
+            OH_LOG_ERROR(LOG_APP, "%{public}s", line.c_str());
+        } else if (level == 1) {
+            OH_LOG_WARN(LOG_APP, "%{public}s", line.c_str());
+        } else {
+            OH_LOG_INFO(LOG_APP, "%{public}s", line.c_str());
+        }
+    });
+
     napi_property_descriptor desc[] = {
         {"hello", nullptr, Hello, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setCaps", nullptr, SetCaps, nullptr, nullptr, nullptr, napi_default, nullptr},
