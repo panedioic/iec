@@ -32,6 +32,7 @@ add_library(iec_har SHARED
     "${IEC_ROOT}/fs/resolver.c"
     "${IEC_ROOT}/loader/loader.cpp"
     "${IEC_GUEST_SWITCH}"
+    "${IEC_ROOT}/common/proc.c"
     "${IEC_ROOT}/common/sock_server.cpp")
 
 target_include_directories(iec_har PRIVATE
