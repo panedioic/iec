@@ -534,6 +534,20 @@ static int virt_exe_self(const char* path, char* out, size_t outsz) {
  * When adding entries note: `to_rel` is a path relative to $IEC_SYSROOT. */
 static const struct { const char* from; const char* to_rel; } kPathMap[] = {
     /* Matched in order, first hit returns — put specific entries first and the fallback last */
+    /* The system bin prefixes the exec server rewrites into FAKE_SYSROOT. A
+     * shell searches PATH itself (stat/access before exec), so without these
+     * entries a bare command name never reaches the exec service: the shell
+     * reports "inaccessible or not found" although the launcher is present in
+     * the fake root. The entries also make `ls /bin` show that root. */
+    { "/bin", "bin" },
+    { "/sbin", "sbin" },
+    { "/usr/bin", "usr/bin" },
+    { "/usr/local/bin", "usr/local/bin" },
+    { "/usr/sbin", "usr/sbin" },
+    { "/system/bin", "system/bin" },
+    { "/vendor/bin", "vendor/bin" },
+    { "/system/lib", "system/lib" },
+    { "/data/app/bin", "data/app/bin" },
     { "/usr/share/X11/xkb", "usr/share/x11/xkb" },
     /* Guests have **no real root filesystem**; absolute paths such as `/usr/...` do not exist
      * on the host. Debs installed by apt are full of these: code-server's
