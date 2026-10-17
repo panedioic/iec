@@ -4,6 +4,7 @@
 // exec/caps.cpp, so ArkTS can read or pin the same word the reference server
 // uses.
 #include <napi/native_api.h>
+#include <sys/stat.h>
 
 #include <exception>
 #include <memory>
@@ -132,6 +133,15 @@ void StopServersLocked() {
     }
 }
 
+// The sandbox paths in constant.h point at directories the application owns but
+// that are not necessarily created yet. bind() would fail with ENOENT; create
+// the parent, and let bind() report anything else.
+void EnsureParentDir(const std::string& path) {
+    const size_t slash = path.rfind('/');
+    if (slash == std::string::npos || slash == 0) return;
+    mkdir(path.substr(0, slash).c_str(), 0755);
+}
+
 // startIecServer(ttyPath?: string, execPath?: string): boolean
 napi_value StartServer(napi_env env, napi_callback_info info) {
     size_t argc = 2;
@@ -155,6 +165,8 @@ napi_value StartServer(napi_env env, napi_callback_info info) {
 
             const std::string tty = tty_path.empty() ? TTY_SOCK_PATH : tty_path;
             const std::string exe = exec_path.empty() ? EXEC_SOCK_PATH : exec_path;
+            EnsureParentDir(tty);
+            EnsureParentDir(exe);
 
             try {
                 auto tty_srv = std::make_unique<TtyServer>(tty);
