@@ -30,6 +30,7 @@
 #include "exec_shebang.h"
 #include "exec_so.h"
 #include "exec_types.h"
+#include "logger/logger.h"
 
 struct SpawnResult {
     pid_t      pid = -1;
@@ -236,8 +237,9 @@ static pid_t ParentPidFor(const SpawnRequest& req) {
     // program that is perfectly startable. The caller's own pid is the fallback --
     // it is at least the process the request came from -- and it is reported, so
     // that a table full of entries filed under a dead pid is not a silent thing.
-    fprintf(stderr, "[exec] no parent for caller %d: %s; recording the caller as the parent\n",
-            (int)req.caller_pid, strerror(errno));
+    Logger::GetInstance()->LogW(
+        "[exec] no parent for caller %d: %s; recording the caller as the parent",
+        (int)req.caller_pid, strerror(errno));
     return req.caller_pid;
 }
 
@@ -416,7 +418,7 @@ SpawnResult Spawn(const SpawnRequest& req) {
 
     pid_t pid = fork();
     if (pid < 0) {
-        fprintf(stderr, "[exec] fork failed!\n");
+        Logger::GetInstance()->LogE("[exec] fork failed: %s", strerror(errno));
         res.pid = -1;
         return res;
     } else if (pid == 0) {
@@ -596,7 +598,7 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     size_t off;
 
     if (n < 20) {
-        fprintf(stderr, "[exec] request too short: %zu bytes\n", n);
+        Logger::GetInstance()->LogE("[exec] request too short: %zu bytes", n);
         return false;
     }
     flags = get32(b);
@@ -606,7 +608,7 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     // be guessing at the shape of the table. Such a request is refused.
     method = get32(b + 4);
     if (method >= CALL_METHOD_END) {
-        fprintf(stderr, "[exec] unknown call method %u\n", method);
+        Logger::GetInstance()->LogE("[exec] unknown call method %u", method);
         return false;
     }
     sr.call_method = static_cast<CallMethod>(method);
@@ -619,7 +621,7 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     // cannot be tested for liveness later.
     sr.caller_pid = static_cast<pid_t>(req.caller);
     if (sr.caller_pid <= 0) {
-        fprintf(stderr, "[exec] invalid caller pid %d\n", (int)sr.caller_pid);
+        Logger::GetInstance()->LogE("[exec] invalid caller pid %d", (int)sr.caller_pid);
         return false;
     }
     argc = get32(b + 8);
@@ -632,12 +634,12 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     // matched up, they might be off by one, and the child would get the caller's
     // stderr on its stdout -- so the request is refused rather than guessed at.
     if (fd_count != req.fds.size()) {
-        fprintf(stderr, "[exec] fd_count %u does not match %zu attached fds\n",
-                fd_count, req.fds.size());
+        Logger::GetInstance()->LogE(
+            "[exec] fd_count %u does not match %zu attached fds", fd_count, req.fds.size());
         return false;
     }
     if (n < 20 + (size_t)fd_count * 4) {
-        fprintf(stderr, "[exec] request too short for %u fd targets\n", fd_count);
+        Logger::GetInstance()->LogE("[exec] request too short for %u fd targets", fd_count);
         return false;
     }
 
@@ -651,7 +653,8 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
         // taking the entry while ignoring it would silently drop what the caller
         // asked for, so an unknown target is an invalid request.
         if (target > STDERR_FILENO) {
-            fprintf(stderr, "[exec] fd target %u is not a standard descriptor\n", target);
+            Logger::GetInstance()->LogE(
+                "[exec] fd target %u is not a standard descriptor", target);
             return false;
         }
         sr.stdio_fds.push_back(InheritedFd{req.fds[i], static_cast<int>(target)});
@@ -663,7 +666,7 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
         size_t start = off;
         while (off < n && b[off] != '\0') off++;
         if (off >= n) {
-            fprintf(stderr, "[exec] %s: string is not terminated\n", what);
+            Logger::GetInstance()->LogE("[exec] %s: string is not terminated", what);
             return false;
         }
         out.assign(reinterpret_cast<const char*>(b + start), off - start);
@@ -679,8 +682,8 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
 
     const bool self_path = ResolveSelfPath(&file, sr.caller_pid);
     if (self_path)
-        fprintf(stderr, "[exec] self path -> %s (caller %d)\n",
-                file.c_str(), (int)sr.caller_pid);
+        Logger::GetInstance()->LogI("[exec] self path -> %s (caller %d)",
+                                    file.c_str(), (int)sr.caller_pid);
 
     // Every request passes through here, whatever member of the family sent it, which is
     // why the fake root is applied at this point rather than inside the path search. That
@@ -692,38 +695,42 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     // command on a terminal always waits), and no process name is carried by the
     // request yet.
 
-    fprintf(stderr, "[exec] file=%s cwd=%s flags=0x%x method=%d caller=%d argc=%u envc=%u fds=%zu",
-            file.c_str(), cwd.empty() ? "(inherit)" : cwd.c_str(),
-            flags, (int)sr.call_method, (int)sr.caller_pid, argc, envc, req.fds.size());
-    for (size_t i = 0; i < sr.stdio_fds.size(); i++)
-        fprintf(stderr, " %d->%d", sr.stdio_fds[i].source_fd, sr.stdio_fds[i].target_fd);
-    fputc('\n', stderr);
+    std::string fd_map;
+    for (const InheritedFd& fd : sr.stdio_fds)
+        fd_map += " " + std::to_string(fd.source_fd) + "->" + std::to_string(fd.target_fd);
+    Logger::GetInstance()->LogI(
+        "[exec] file=%s cwd=%s flags=0x%x method=%d caller=%d argc=%u envc=%u fds=%zu%s",
+        file.c_str(), cwd.empty() ? "(inherit)" : cwd.c_str(),
+        flags, (int)sr.call_method, (int)sr.caller_pid, argc, envc, req.fds.size(),
+        fd_map.c_str());
 
     for (uint32_t i = 0; i < argc; i++) {
         std::string a;
         if (!next("argv", a)) return false;
-        fprintf(stderr, "[exec]   argv[%u] = %s\n", i, a.c_str());
+        Logger::GetInstance()->LogI("[exec]   argv[%u] = %s", i, a.c_str());
         sr.argv.push_back(a);
     }
     for (uint32_t i = 0; i < envc; i++) {
         std::string e;
         if (!next("env", e)) return false;
-        fprintf(stderr, "[exec]   env[%u] = %s\n", i, e.c_str());
+        Logger::GetInstance()->LogI("[exec]   env[%u] = %s", i, e.c_str());
         sr.env.push_back(e);
     }
-    if (off != n) fprintf(stderr, "[exec] %zu trailing bytes ignored\n", n - off);
+    if (off != n)
+        Logger::GetInstance()->LogW("[exec] %zu trailing bytes ignored", n - off);
 
     if (SearchesPath(sr.call_method)) {
         sr.path = ResolveFilePath(file, sr.env, sr.cwd);
         if (sr.path.empty()) {
-            fprintf(stderr, "[exec] %s: no such file on PATH (method %d)\n",
-                    file.c_str(), (int)sr.call_method);
+            Logger::GetInstance()->LogW("[exec] %s: no such file on PATH (method %d)",
+                                        file.c_str(), (int)sr.call_method);
             put32(reply.body, 0);                        // no pid: nothing was started
             put32(reply.body, static_cast<uint32_t>(ENOENT));
             return true;
         }
         if (sr.path != file)
-            fprintf(stderr, "[exec] %s resolved to %s\n", file.c_str(), sr.path.c_str());
+            Logger::GetInstance()->LogI("[exec] %s resolved to %s",
+                                        file.c_str(), sr.path.c_str());
     } else {
         sr.path = file;
     }
@@ -736,11 +743,12 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     // way to name this child, and OP_WAIT is how it collects the exit status.
     SpawnResult res = Spawn(sr);
     if (res.pid < 0) {
-        fprintf(stderr, "[exec] spawn failed: %s\n",
-                res.error.empty() ? "unknown error" : res.error.c_str());
+        Logger::GetInstance()->LogE(
+            "[exec] spawn failed: %s",
+            res.error.empty() ? "unknown error" : res.error.c_str());
         return false;
     }
-    fprintf(stderr, "[exec] spawned pid %d\n", (int)res.pid);
+    Logger::GetInstance()->LogI("[exec] spawned pid %d", (int)res.pid);
     put32(reply.body, static_cast<uint32_t>(res.pid));
     return true;
 }
@@ -757,14 +765,15 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
 // some future feature has to be refused here rather than looked up and passed on.
 bool ExecServer::onWait(const Packet& req, Reply& reply) {
     if (req.body.size() < 4) {
-        fprintf(stderr, "[exec] wait request too short: %zu bytes\n", req.body.size());
+        Logger::GetInstance()->LogE("[exec] wait request too short: %zu bytes", req.body.size());
         return false;
     }
     pid_t pid = static_cast<pid_t>(get32(req.body.data()));
 
     auto it = procmap.find(pid);
     if (it == procmap.end()) {
-        fprintf(stderr, "[exec] wait for pid %d: not a process this server spawned\n", (int)pid);
+        Logger::GetInstance()->LogW(
+            "[exec] wait for pid %d: not a process this server spawned", (int)pid);
         return false;
     }
 
@@ -797,7 +806,7 @@ bool ExecServer::onWait(const Packet& req, Reply& reply) {
         put32(reply.body, static_cast<uint32_t>(it->second.status));
         return true;
     }
-    fprintf(stderr, "[exec] waitpid(%d) failed: %s\n", (int)pid, strerror(errno));
+    Logger::GetInstance()->LogE("[exec] waitpid(%d) failed: %s", (int)pid, strerror(errno));
     return false;
 }
 
@@ -817,7 +826,7 @@ bool ExecServer::onWait(const Packet& req, Reply& reply) {
 // server may be asked about, not the kernel.
 bool ExecServer::onSignal(const Packet& req, Reply& reply) {
     if (req.body.size() < 8) {
-        fprintf(stderr, "[exec] signal request too short: %zu bytes\n", req.body.size());
+        Logger::GetInstance()->LogE("[exec] signal request too short: %zu bytes", req.body.size());
         return false;
     }
     pid_t pid = static_cast<pid_t>(get32(req.body.data()));
@@ -825,8 +834,9 @@ bool ExecServer::onSignal(const Packet& req, Reply& reply) {
 
     auto it = procmap.find(pid);
     if (it == procmap.end()) {
-        fprintf(stderr, "[exec] signal %d for pid %d: not a process this server spawned\n",
-                signo, (int)pid);
+        Logger::GetInstance()->LogW(
+            "[exec] signal %d for pid %d: not a process this server spawned",
+            signo, (int)pid);
         return false;
     }
 
@@ -837,7 +847,8 @@ bool ExecServer::onSignal(const Packet& req, Reply& reply) {
     // other failure (EINVAL for a signal number that does not exist, EPERM) is
     // reported to the client rather than swallowed.
     if (kill(pid, signo) < 0 && errno != ESRCH) {
-        fprintf(stderr, "[exec] kill(%d, %d) failed: %s\n", (int)pid, signo, strerror(errno));
+        Logger::GetInstance()->LogE("[exec] kill(%d, %d) failed: %s",
+                                    (int)pid, signo, strerror(errno));
         return false;
     }
     // The reply is empty: whether the signal was accepted or refused is the whole

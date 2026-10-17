@@ -6,6 +6,7 @@
 #include "common/constant.h"
 #include "exec/caps.h"
 #include "exec/exec_server.h"
+#include "logger/logger.h"
 #include "tty/tty_server.h"
 
 static TtyServer*  g_tty_server  = nullptr;
@@ -76,7 +77,7 @@ int main(int argc, char** argv) {
         tty_srv.stopAndJoin();
         exec_srv.stopAndJoin();
     } catch (const std::exception& e) {
-        fprintf(stderr, "error: %s\n", e.what());
+        Logger::GetInstance()->LogE("error: %s", e.what());
         return 1;
     }
     return 0;

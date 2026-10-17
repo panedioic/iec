@@ -13,6 +13,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "logger/logger.h"
+
 namespace {
 
 // Sends fds over SCM_RIGHTS attached to the given bytes. On a stream socket the
@@ -88,7 +90,7 @@ int PeerPidOf(int fd) {
     socklen_t len = sizeof cred;
 
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) {
-        fprintf(stderr, "[server] SO_PEERCRED failed: %s\n", strerror(errno));
+        Logger::GetInstance()->LogW("[server] SO_PEERCRED failed: %s", strerror(errno));
         return 0;
     }
     return static_cast<int>(cred.pid);
@@ -180,9 +182,8 @@ void SockServer::start() {
         listen(listen_fd_, 16) < 0)
         throw std::runtime_error(std::string("bind/listen: ") + strerror(errno));
     bound_ = true;
-    // Logging goes to stderr: the server is usually put in the background, and when stdout is
-    // redirected to a file it is fully buffered, so this line would stay stuck in the buffer unseen
-    fprintf(stderr, "[server] listening on %s\n", path_.c_str());
+    // The server is usually put in the background; the logger flushes stderr.
+    Logger::GetInstance()->LogI("[server] listening on %s", path_.c_str());
 }
 
 void SockServer::run() {
@@ -220,12 +221,12 @@ void SockServer::run() {
                     // again right away and the loop would spin at 100% CPU (EMFILE is the
                     // usual cause). Back off briefly instead of retrying immediately.
                     if (errno != EINTR) {
-                        fprintf(stderr, "[server] accept: %s\n", strerror(errno));
+                        Logger::GetInstance()->LogE("[server] accept: %s", strerror(errno));
                         usleep(10 * 1000);
                     }
                 } else if (conns.size() >= kMaxClients) {
                     // Without a cap, one client can exhaust the server's memory and fds.
-                    fprintf(stderr, "[server] too many clients, dropping connection\n");
+                    Logger::GetInstance()->LogW("[server] too many clients, dropping connection");
                     close(c);
                 } else {
                     // The peer credentials are taken once, here, and travel with the

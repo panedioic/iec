@@ -46,8 +46,8 @@ set(IEC_INCLUDES
 
 # ── caps ──────────────────────────────────────────────────────────────────
 # A separate object so the OHOS HAR can reuse it without pulling in either the
-# server or the preload shim.
-add_library(iec_caps STATIC exec/caps.cpp)
+# server or the preload shim. Logger rides along because caps logs its result.
+add_library(iec_caps STATIC exec/caps.cpp logger/logger.cpp)
 target_include_directories(iec_caps PUBLIC ${IEC_INCLUDES})
 target_compile_definitions(iec_caps PRIVATE _GNU_SOURCE)
 target_compile_options(iec_caps PRIVATE -Wall)
@@ -66,7 +66,6 @@ add_executable(iec_server
     exec/exec_qemu.cpp
     exec/exec_shebang.cpp
     exec/elf.cpp
-    logger/logger.cpp
     common/sock_server.cpp)
 
 target_include_directories(iec_server PRIVATE ${IEC_INCLUDES})

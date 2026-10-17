@@ -36,6 +36,8 @@
 #  include <sys/prctl.h>
 #endif
 
+#include "logger/logger.h"
+
 // execve() takes the environment as a plain array; the C library owns it.
 extern char** environ;
 
@@ -51,9 +53,10 @@ constexpr size_t kProbePage = 4096;
 constexpr long kJitPrctlOpt = 0x6a6974L;
 
 void LogCaps(const char* source) {
-    fprintf(stderr, "[exec] capabilities (%s): fork=%d exec=%d jit=%d path=%d (0o%llo)\n",
-            source, g_caps.fork, g_caps.exec, g_caps.jit, g_caps.path,
-            static_cast<unsigned long long>(PackCaps(g_caps)));
+    Logger::GetInstance()->LogI(
+        "[exec] capabilities (%s): fork=%d exec=%d jit=%d path=%d (0o%llo)",
+        source, g_caps.fork, g_caps.exec, g_caps.jit, g_caps.path,
+        static_cast<unsigned long long>(PackCaps(g_caps)));
 }
 
 /* ------------------------------------------------------------------ */

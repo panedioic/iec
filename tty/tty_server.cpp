@@ -54,6 +54,8 @@
 #include <cstring>
 #include <functional>
 
+#include "logger/logger.h"
+
 namespace {
 
 constexpr int kMaxPtys = 64;
@@ -402,11 +404,11 @@ bool TtyServer::onOpenPtmx(const Packet& req, Reply& reply) {
     int b[2] = {-1, -1};
 
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, a) < 0) {
-        fprintf(stderr, "[server] socketpair: %s\n", strerror(errno));
+        Logger::GetInstance()->LogE("[server] socketpair: %s", strerror(errno));
         return false;
     }
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, b) < 0) {
-        fprintf(stderr, "[server] socketpair: %s\n", strerror(errno));
+        Logger::GetInstance()->LogE("[server] socketpair: %s", strerror(errno));
         close(a[0]);
         close(a[1]);
         return false;
@@ -414,7 +416,7 @@ bool TtyServer::onOpenPtmx(const Packet& req, Reply& reply) {
 
     Pty* e = allocPty();
     if (!e) {
-        fprintf(stderr, "[server] openptmx: out of pty slots\n");
+        Logger::GetInstance()->LogE("[server] openptmx: out of pty slots");
         close(a[0]); close(a[1]);
         close(b[0]); close(b[1]);
         return false;
@@ -450,7 +452,7 @@ bool TtyServer::onOpenPtmx(const Packet& req, Reply& reply) {
     // The framework closes a[0] once the kernel has taken its own reference.
     reply.fds.push_back(a[0]);
 
-    fprintf(stderr, "[server] /dev/ptmx -> pts/%d (master handed over)\n", e->pts_n);
+    Logger::GetInstance()->LogI("[server] /dev/ptmx -> pts/%d (master handed over)", e->pts_n);
     return true;
 }
 
@@ -460,11 +462,11 @@ bool TtyServer::onOpenPts(const Packet& req, Reply& reply) {
     int pts_n = static_cast<int>(get32(req.body.data()));
     Pty* e = findByPts(pts_n);
     if (!e) {
-        fprintf(stderr, "[server] openpts: pts/%d not found\n", pts_n);
+        Logger::GetInstance()->LogW("[server] openpts: pts/%d not found", pts_n);
         return false;
     }
     if (e->slave_fd < 0) {
-        fprintf(stderr, "[server] openpts: pts/%d slave already handed over\n", pts_n);
+        Logger::GetInstance()->LogW("[server] openpts: pts/%d slave already handed over", pts_n);
         return false;
     }
 
@@ -477,7 +479,7 @@ bool TtyServer::onOpenPts(const Packet& req, Reply& reply) {
     // of the fd it already has.
     e->slave_fd = -1;
 
-    fprintf(stderr, "[server] /dev/pts/%d -> slave handed over\n", pts_n);
+    Logger::GetInstance()->LogI("[server] /dev/pts/%d -> slave handed over", pts_n);
     return true;
 }
 
@@ -590,7 +592,7 @@ bool TtyServer::onIdentify(const Packet& req, Reply& reply) {
     socklen_t cred_len = sizeof cred;
 
     if (req.fds.size() != 1) {
-        fprintf(stderr, "[server] identify: expected one fd, got %zu\n", req.fds.size());
+        Logger::GetInstance()->LogW("[server] identify: expected one fd, got %zu", req.fds.size());
         return false;
     }
     int fd = req.fds[0];
