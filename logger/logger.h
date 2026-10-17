@@ -2,7 +2,8 @@
 //
 // The two sinks implemented here are:
 //   stderr — the process's own stderr (on by default)
-//   file   — one file per process under $IEC_LOG_DIR or $HOME/logs
+//   file   — one file per process under IEC_LOG_DIR (compile-time), or
+//            $IEC_LOG_DIR / $HOME/logs, named with pid + timestamp
 //
 // TTY output and hilog are deliberately not implemented in this module.
 #pragma once

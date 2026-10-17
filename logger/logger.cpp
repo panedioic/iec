@@ -1,6 +1,8 @@
 // logger/logger.cpp — see logger/logger.h.
 #include "logger/logger.h"
 
+#include "common/constant.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -15,23 +17,35 @@ char LevelTag(int level) {
     return 'I';
 }
 
-// One file per process: $IEC_LOG_DIR/iec-<pid>-<start>.log when the variable
-// is set, otherwise $HOME/logs/iec-<pid>-<start>.log. An empty result means
-// the file sink has nowhere to write and is skipped.
-std::string DefaultLogPath() {
+// The directory comes from the compile-time IEC_LOG_DIR when the platform
+// defines it, otherwise from $IEC_LOG_DIR or $HOME/logs. The file name is
+// assembled at runtime from the pid and a timestamp.
+std::string LogDirectory() {
+#ifdef IEC_LOG_DIR
+    return IEC_LOG_DIR;
+#else
     const char* dir = getenv("IEC_LOG_DIR");
-    std::string base;
+    if (dir && *dir) return dir;
+    const char* home = getenv("HOME");
+    if (home && *home) return std::string(home) + "/logs";
+    return std::string();
+#endif
+}
 
-    if (dir && *dir) {
-        base = dir;
-    } else {
-        const char* home = getenv("HOME");
-        if (home && *home) base = std::string(home) + "/logs";
+std::string DefaultLogPath() {
+    std::string base = LogDirectory();
+    if (base.empty()) return std::string();
+    while (base.size() > 1 && base.back() == '/') base.pop_back();
+
+    char stamp[32];
+    const time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    if (strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tmv) == 0) {
+        std::snprintf(stamp, sizeof stamp, "%lu", (unsigned long)now);
     }
 
-    if (base.empty()) return std::string();
-    return base + "/iec-" + std::to_string((long)getpid()) + "-" +
-           std::to_string((unsigned long)time(nullptr)) + ".log";
+    return base + "/iec-" + std::to_string((long)getpid()) + "-" + stamp + ".log";
 }
 
 }  // namespace

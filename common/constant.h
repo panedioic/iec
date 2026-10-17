@@ -19,6 +19,7 @@
 #define PATH_QEMU_X86_64_SO     "/data/storage/el1/bundle/libs/arm64/libqemu-x86_64.so"
 #define PATH_QEMU_AARCH64_SO    "/data/storage/el1/bundle/libs/arm64/libqemu-aarch64.so"
 #define FAKE_SYSROOT            "/data/storage/el2/base/files"
+#define IEC_LOG_DIR             "/data/storage/el2/base/files/logs"
 
 #endif
 
