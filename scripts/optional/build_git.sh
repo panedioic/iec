@@ -61,17 +61,11 @@ NO_FORTIFY="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
 log() { echo "=== $* ===" >&2; }
 err() { echo "ERROR: $*" >&2; exit 1; }
 
-need_deps=0
-for f in \
-	"$DEPS_LIB/libz.a" \
-	"$DEPS_LIB/libpcre2-8.a" \
-	"$OPENSSL/lib/libssl.a" \
-	"$CURL_PREFIX/lib/libcurl.a"; do
-	[ -f "$f" ] || need_deps=1
-done
-if [ "$need_deps" -ne 0 ]; then
-	"$IEC_ROOT/scripts/optional/build_git_deps.sh"
-fi
+[ -f "$DEPS_LIB/libz.a" ] || "$IEC_ROOT/scripts/optional/build_zlib.sh"
+[ -f "$DEPS_LIB/libpcre2-8.a" ] || "$IEC_ROOT/scripts/optional/build_pcre2.sh"
+[ -f "$OPENSSL/lib/libssl.a" ] || "$IEC_ROOT/scripts/optional/build_openssl.sh"
+[ -f "$CURL_PREFIX/lib/libcurl.a" ] || "$IEC_ROOT/scripts/optional/build_curl.sh"
+
 for f in \
 	"$DEPS_LIB/libz.a" \
 	"$DEPS_LIB/libpcre2-8.a" \
