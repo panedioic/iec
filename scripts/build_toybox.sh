@@ -23,40 +23,38 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TOYBOX_SRC="${TOYBOX_SRC:-$ROOT/../thirdparty/toybox}"
-PATCH_DIR="${TOYBOX_PATCH_DIR:-$ROOT/../scripts/toybox-ohos/patches}"
+ENV_FILE="$ROOT/scripts/env.sh"
+[ -f "$ENV_FILE" ] || ENV_FILE="$ROOT/scripts/env.sh.example"
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/lib/common.sh"
+
+TOYBOX_SRC="${TOYBOX_SRC:-$ROOT/thirdparty/toybox}"
+PATCH_DIR="${TOYBOX_PATCH_DIR:-$ROOT/scripts/toybox-ohos/patches}"
 SRC="$ROOT/build/toybox-iec"
 OUTDIR="$ROOT/platform/ohos/har/libs/arm64-v8a"
 OUT="$OUTDIR/libtoybox.so"
 
-OHOS_SDK="${OHOS_SDK:-/apps/harmony/sdk/default/openharmony}"
-OHOS_CLANG="$OHOS_SDK/native/llvm/bin/clang"
-NM="$OHOS_SDK/native/llvm/bin/llvm-nm"
-READELF="$OHOS_SDK/native/llvm/bin/llvm-readelf"
+[ -f "$TOYBOX_SRC/Makefile" ] || iec_clone_if_missing "$TOYBOX_SRC" "${IEC_TOYBOX_REPO:-}"
 
 CC=""; EXTRA=""
 if [ -n "${TOYBOX_CC:-}" ]; then
 	CC="$TOYBOX_CC"
 else
-	[ -x "$OHOS_CLANG" ] || {
-		echo "error: $OHOS_CLANG not found (set TOYBOX_CC or OHOS_SDK)" >&2
-		exit 1
-	}
-	CC="$OHOS_CLANG"
-	EXTRA="--target=aarch64-linux-ohos --sysroot=$OHOS_SDK/native/sysroot -fuse-ld=lld"
+	[ -x "$CLANG" ] || iec_err "$CLANG not found (set TOYBOX_CC or CLANG)"
+	CC="$CLANG"
+	EXTRA="--target=$TARGET --sysroot=$SYSROOT -fuse-ld=lld"
 fi
+NM="${NM:-$CLANG_DIR/llvm-nm}"
+READELF="${READELF:-$CLANG_DIR/llvm-readelf}"
 HOSTCC="${HOSTCC:-cc}"
 
-[ -d "$TOYBOX_SRC" ] || {
-	echo "error: toybox sources not found: $TOYBOX_SRC (set TOYBOX_SRC)" >&2
-	exit 1
-}
-
 echo "==> copy sources -> $SRC" >&2
+# Rebuild the working copy from scratch: a previous run can leave a .git entry
+# of a different kind (file vs directory) and cp -a then refuses to overwrite it.
+rm -rf "$SRC"
 mkdir -p "$SRC"
-# A previous run leaves the built toybox binary at mode 0555; cp -a over it is
-# refused. They are outputs and will be rebuilt.
-rm -f "$SRC/toybox" "$SRC/toybox-aarch64-linux-ohos"
 cp -a "$TOYBOX_SRC/." "$SRC/"
 
 if [ -d "$PATCH_DIR" ]; then

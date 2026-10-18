@@ -22,30 +22,28 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${MKSH_SRC:-$ROOT/../thirdparty/mksh}"
+ENV_FILE="$ROOT/scripts/env.sh"
+[ -f "$ENV_FILE" ] || ENV_FILE="$ROOT/scripts/env.sh.example"
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/lib/common.sh"
+
+SRC="${MKSH_SRC:-$ROOT/thirdparty/mksh}"
 BUILD="$ROOT/build/mksh-iec"
 OUTDIR="$ROOT/platform/ohos/har/libs/arm64-v8a"
 OUT="$OUTDIR/libmksh.so"
 
-OHOS_SDK="${OHOS_SDK:-/apps/harmony/sdk/default/openharmony}"
-OHOS_CLANG="$OHOS_SDK/native/llvm/bin/clang"
-NM="$OHOS_SDK/native/llvm/bin/llvm-nm"
-READELF="$OHOS_SDK/native/llvm/bin/llvm-readelf"
+[ -f "$SRC/main.c" ] || iec_clone_if_missing "$SRC" "${IEC_MKSH_REPO:-}"
 
 if [ -n "${MKSH_CC:-}" ]; then
 	CC="$MKSH_CC"
 else
-	[ -x "$OHOS_CLANG" ] || {
-		echo "error: $OHOS_CLANG not found (set MKSH_CC or OHOS_SDK)" >&2
-		exit 1
-	}
-	CC="$OHOS_CLANG --target=aarch64-linux-ohos --sysroot=$OHOS_SDK/native/sysroot -fuse-ld=lld"
+	[ -x "$CLANG" ] || iec_err "$CLANG not found (set MKSH_CC or CLANG)"
+	CC="$CLANG --target=$TARGET --sysroot=$SYSROOT -fuse-ld=lld"
 fi
-
-[ -f "$SRC/main.c" ] || {
-	echo "error: mksh sources not found: $SRC (set MKSH_SRC)" >&2
-	exit 1
-}
+NM="${NM:-$CLANG_DIR/llvm-nm}"
+READELF="${READELF:-$CLANG_DIR/llvm-readelf}"
 
 # The same definitions BetterSH's shell build uses, taken from the OHOS mksh
 # BUILD.gn. They describe the C library the shell is compiled against.

@@ -32,30 +32,23 @@
 set -euo pipefail
 
 IEC_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-PARENT="$(cd "$IEC_ROOT/.." && pwd)"
+ENV_FILE="$IEC_ROOT/scripts/env.sh"
+[ -f "$ENV_FILE" ] || ENV_FILE="$IEC_ROOT/scripts/env.sh.example"
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+# shellcheck disable=SC1091
+source "$IEC_ROOT/scripts/lib/common.sh"
 
-if [ -f "$PARENT/scripts/env.sh" ]; then
-	# shellcheck disable=SC1091
-	source "$PARENT/scripts/env.sh"
-fi
-
-SRC_SUBMODULE="${DROPBEAR_SRC:-$PARENT/thirdparty/dropbear}"
+SRC_SUBMODULE="${DROPBEAR_SRC:-$IEC_ROOT/thirdparty/dropbear}"
 SRC="${DROPBEAR_SRC_COPY:-$IEC_ROOT/build/dropbear-src}"
 BUILD="${DROPBEAR_BUILD:-$IEC_ROOT/build/dropbear}"
-PATCH="${DROPBEAR_PATCH:-$PARENT/scripts/dropbear-ohos.patch}"
+PATCH="${DROPBEAR_PATCH:-$IEC_ROOT/scripts/dropbear-ohos.patch}"
 OUTDIR="${OUTDIR:-$IEC_ROOT/platform/ohos/har/libs/arm64-v8a}"
 OUT="$OUTDIR/libdropbear.so"
 
-OHOS_SDK="${OHOS_SDK:-/apps/harmony/sdk/default/openharmony}"
-CLANG="${CLANG:-$OHOS_SDK/native/llvm/bin/clang}"
-CLANG_DIR="${CLANG_DIR:-$(dirname "$CLANG")}"
-TARGET="${TARGET:-aarch64-linux-ohos}"
-SYSROOT="${SYSROOT:-$OHOS_SDK/native/sysroot}"
-NATIVE_ARCH="${NATIVE_ARCH:-arm64-v8a}"
 NM="${NM:-$CLANG_DIR/llvm-nm}"
 READELF="${READELF:-$CLANG_DIR/llvm-readelf}"
 OBJCOPY="${OBJCOPY:-$CLANG_DIR/llvm-objcopy}"
-JOBS="${JOBS:-$(nproc)}"
 
 case "$NATIVE_ARCH" in
 	arm64-v8a) CONFIG_HOST="aarch64-unknown-linux-musl" ;;
@@ -68,6 +61,8 @@ CC="$CLANG --target=$TARGET --sysroot=$SYSROOT -fuse-ld=lld"
 log() { echo "=== $* ===" >&2; }
 err() { echo "ERROR: $*" >&2; exit 1; }
 
+[ -f "$SRC_SUBMODULE/configure" ] || \
+	iec_clone_if_missing "$SRC_SUBMODULE" "${IEC_DROPBEAR_REPO:-}"
 [ -f "$SRC_SUBMODULE/configure" ] || err "missing dropbear sources: $SRC_SUBMODULE"
 [ -f "$PATCH" ] || err "missing patch: $PATCH"
 [ -x "$OBJCOPY" ] || err "missing objcopy: $OBJCOPY"

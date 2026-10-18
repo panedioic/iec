@@ -29,38 +29,29 @@
 set -euo pipefail
 
 IEC_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-PARENT="$(cd "$IEC_ROOT/.." && pwd)"
-
-# The parent tree owns the toolchain paths and the third-party build outputs.
-if [ -f "$PARENT/scripts/env.sh" ]; then
-	# shellcheck disable=SC1091
-	source "$PARENT/scripts/env.sh"
-fi
+ENV_FILE="$IEC_ROOT/scripts/env.sh"
+[ -f "$ENV_FILE" ] || ENV_FILE="$IEC_ROOT/scripts/env.sh.example"
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+# shellcheck disable=SC1091
+source "$IEC_ROOT/scripts/lib/common.sh"
 
 GIT_VER="${GIT_VER:-2.56.0}"
-GIT_TARBALL="${GIT_TARBALL:-$PARENT/thirdparty/git-$GIT_VER.tar.xz}"
-GIT_SRC="${GIT_SRC:-$IEC_ROOT/build/git-src}"
+GIT_SRC="${GIT_SRC:-$IEC_ROOT/thirdparty/git}"
 BUILD="${BUILD:-$IEC_ROOT/build/git-so}"
 OUTDIR="${OUTDIR:-$IEC_ROOT/platform/ohos/har/libs/arm64-v8a}"
 OUT="$OUTDIR/libgit.so"
 
-OHOS_SDK="${OHOS_SDK:-/apps/harmony/sdk/default/openharmony}"
-CLANG="${CLANG:-$OHOS_SDK/native/llvm/bin/clang}"
-CLANG_DIR="${CLANG_DIR:-$(dirname "$CLANG")}"
-TARGET="${TARGET:-aarch64-linux-ohos}"
-SYSROOT="${SYSROOT:-$OHOS_SDK/native/sysroot}"
 AR="${AR:-$CLANG_DIR/llvm-ar}"
 RANLIB="${RANLIB:-$CLANG_DIR/llvm-ranlib}"
 NM="${NM:-$CLANG_DIR/llvm-nm}"
 READELF="${READELF:-$CLANG_DIR/llvm-readelf}"
 OBJCOPY="${OBJCOPY:-$CLANG_DIR/llvm-objcopy}"
-JOBS="${JOBS:-$(nproc)}"
 
-SYSROOT_EXT="${SYSROOT_EXT:-$PARENT/build/sysroot-ext-arm64-v8a}"
-DEPS_LIB="${SYSROOT_EXT_LIB:-$SYSROOT_EXT/usr/lib/aarch64-linux-ohos}"
-DEPS_INC="${SYSROOT_EXT_INC:-$SYSROOT_EXT/usr/include}"
-OPENSSL="${OPENSSL:-$PARENT/build/openssl}"
-CURL_PREFIX="${CURL_PREFIX:-$PARENT/build/curl}"
+DEPS_LIB="${IEC_DEPS_LIB:-$IEC_DEPS_DIR/usr/lib/aarch64-linux-ohos}"
+DEPS_INC="${IEC_DEPS_INC:-$IEC_DEPS_DIR/usr/include}"
+OPENSSL="${OPENSSL:-$IEC_OPENSSL_DIR}"
+CURL_PREFIX="${CURL_PREFIX:-$IEC_CURL_DIR}"
 
 CC_TARGET="$CLANG --target=$TARGET --sysroot=$SYSROOT"
 TRIPLE_FLAGS="--target=$TARGET --sysroot=$SYSROOT"
@@ -70,20 +61,27 @@ NO_FORTIFY="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
 log() { echo "=== $* ===" >&2; }
 err() { echo "ERROR: $*" >&2; exit 1; }
 
+need_deps=0
 for f in \
 	"$DEPS_LIB/libz.a" \
 	"$DEPS_LIB/libpcre2-8.a" \
 	"$OPENSSL/lib/libssl.a" \
 	"$CURL_PREFIX/lib/libcurl.a"; do
-	[ -f "$f" ] || err "missing $f (run the parent tree's dependency builds first)"
+	[ -f "$f" ] || need_deps=1
+done
+if [ "$need_deps" -ne 0 ]; then
+	"$IEC_ROOT/scripts/optional/build_git_deps.sh"
+fi
+for f in \
+	"$DEPS_LIB/libz.a" \
+	"$DEPS_LIB/libpcre2-8.a" \
+	"$OPENSSL/lib/libssl.a" \
+	"$CURL_PREFIX/lib/libcurl.a"; do
+	[ -f "$f" ] || err "missing $f after building the git dependencies"
 done
 
-if [ ! -f "$GIT_SRC/Makefile" ]; then
-	[ -s "$GIT_TARBALL" ] || err "missing git source tarball: $GIT_TARBALL"
-	log "extract $GIT_TARBALL"
-	mkdir -p "$GIT_SRC"
-	tar xf "$GIT_TARBALL" -C "$GIT_SRC" --strip-components=1
-fi
+[ -f "$GIT_SRC/Makefile" ] || \
+	iec_clone_if_missing "$GIT_SRC" "${IEC_GIT_REPO:-}" "v$GIT_VER"
 
 mkdir -p "$BUILD" "$OUTDIR"
 
@@ -105,7 +103,7 @@ make -C "$GIT_SRC" -j"$JOBS" \
 	NO_TCLTK=YesPlease NO_EXPAT=YesPlease NO_INSTALL_HARDLINKS=YesPlease \
 	SKIP_DASHED_BUILT_INS=YesPlease NO_REGEX=NeedsStartEnd NO_RUST=YesPlease \
 	USE_LIBPCRE2=YesPlease \
-	ZLIB_PATH="$SYSROOT_EXT/usr" \
+	ZLIB_PATH="$IEC_DEPS_DIR/usr" \
 	OPENSSLDIR="$OPENSSL" \
 	CURLDIR="$CURL_PREFIX" \
 	CURL_CFLAGS="-I$CURL_PREFIX/include" \

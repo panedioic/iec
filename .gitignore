@@ -50,3 +50,13 @@ vgcore.*
 /thirdparty/toybox/
 /thirdparty/git/
 /thirdparty/dropbear/
+/thirdparty/pcre2/
+/thirdparty/zlib-*/
+/thirdparty/openssl-*/
+/thirdparty/curl-*/
+/thirdparty/*.tar.gz
+/thirdparty/*.tar.xz
+/thirdparty/*.tar.bz2
+
+# ---- Local environment ----
+/scripts/env.sh
