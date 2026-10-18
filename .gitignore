@@ -42,3 +42,11 @@ Thumbs.db
 core
 core.*
 vgcore.*
+
+# ---- Command sources ----
+# Cloned by ../scripts/build_iec_commands.sh --fetch (upstream scripts do not
+# download anything). Kept out of the submodule.
+/thirdparty/mksh/
+/thirdparty/toybox/
+/thirdparty/git/
+/thirdparty/dropbear/
