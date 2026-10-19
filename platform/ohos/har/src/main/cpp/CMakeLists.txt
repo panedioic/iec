@@ -19,8 +19,29 @@ else()
     set(IEC_GUEST_SWITCH "${IEC_ROOT}/loader/guest_switch_aarch64.S")
 endif()
 
+# The CA bundle is embedded into the library as a generated header. Shipping it
+# as a raw resource would leave a second extraction path in the app; this way
+# the only copy is the one compiled in, and IecInstallCaBundle() writes it where
+# git expects it.
+find_program(IEC_PYTHON NAMES python3 python)
+if(NOT IEC_PYTHON)
+    message(FATAL_ERROR "python3 is required to embed assets/cacert.pem")
+endif()
+set(IEC_CA_SOURCE "${IEC_ROOT}/assets/cacert.pem")
+set(IEC_EMBED_TOOL "${IEC_ROOT}/tools/embed_file.py")
+set(IEC_CA_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/cacert_pem.h")
+add_custom_command(
+    OUTPUT "${IEC_CA_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND "${IEC_PYTHON}" "${IEC_EMBED_TOOL}" "${IEC_CA_SOURCE}"
+            "${IEC_CA_HEADER}" iec_cacert_pem
+    DEPENDS "${IEC_CA_SOURCE}" "${IEC_EMBED_TOOL}"
+    COMMENT "Embedding assets/cacert.pem into cacert_pem.h")
+
 add_library(iec_har SHARED
     napi_init.cpp
+    "${IEC_ROOT}/common/ca_bundle.cpp"
+    "${IEC_CA_HEADER}"
     "${IEC_ROOT}/tty/tty_server.cpp"
     "${IEC_ROOT}/exec/exec_server.cpp"
     "${IEC_ROOT}/exec/path_resolver.cpp"
@@ -38,7 +59,8 @@ add_library(iec_har SHARED
 target_include_directories(iec_har PRIVATE
     "${IEC_ROOT}"
     "${IEC_ROOT}/common"
-    "${IEC_ROOT}/loader")
+    "${IEC_ROOT}/loader"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # common/constant.h supplies the sandbox paths under __OHOS__, so no host paths
 # are defined here.
 target_compile_definitions(iec_har PRIVATE _GNU_SOURCE)

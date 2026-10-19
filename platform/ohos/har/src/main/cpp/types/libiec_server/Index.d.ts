@@ -18,3 +18,7 @@ export const startIecServer: (ttyPath?: string, execPath?: string) => boolean;
 // Stops both services and joins their threads. True when a running server was
 // stopped, false when none was running.
 export const stopIecServer: () => boolean;
+
+// Writes the CA bundle embedded in the library to <dir>/cacert.pem. The default
+// is <fake root>/usr/share/git-core. False means the file could not be written.
+export const installCaBundle: (dir?: string) => boolean;

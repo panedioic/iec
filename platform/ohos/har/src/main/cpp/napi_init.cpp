@@ -22,6 +22,7 @@
 #endif
 #include <hilog/log.h>
 
+#include "common/ca_bundle.h"
 #include "common/constant.h"
 #include "exec/caps.h"
 #include "exec/exec_server.h"
@@ -215,6 +216,29 @@ napi_value StopServer(napi_env env, napi_callback_info /*info*/) {
     return ret;
 }
 
+// installCaBundle(dir?: string): boolean
+// Writes the CA bundle embedded in the library to <dir>/cacert.pem. Missing
+// arguments default to the directory git reads under the fake root.
+napi_value InstallCaBundle(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string dir;
+    if (argc > 0 && !ReadOptionalString(env, argv[0], dir)) return nullptr;
+    if (dir.empty()) dir = std::string(FAKE_SYSROOT) + "/usr/share/git-core";
+
+    const bool ok = IecInstallCaBundle(dir.c_str());
+    if (!ok) {
+        Logger::GetInstance()->LogW("[iec] CA bundle: cannot write to %s",
+                                    dir.c_str());
+    }
+
+    napi_value ret = nullptr;
+    napi_get_boolean(env, ok, &ret);
+    return ret;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     // The logger has no OHOS dependency of its own. Register hilog as a custom
     // sink here, where the NAPI/hilog libraries are already linked.
@@ -228,12 +252,20 @@ napi_value Init(napi_env env, napi_value exports) {
         }
     });
 
+    // The bundle is written once here so it is in place before the first shell
+    // can start git. installCaBundle() stays exported for callers that want to
+    // refresh it after upgrading the embedded copy.
+    if (!IecInstallCaBundle(FAKE_SYSROOT "/usr/share/git-core")) {
+        Logger::GetInstance()->LogW("[iec] CA bundle: cannot write at init");
+    }
+
     napi_property_descriptor desc[] = {
         {"hello", nullptr, Hello, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setCaps", nullptr, SetCaps, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"probeCaps", nullptr, ProbeCaps, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startIecServer", nullptr, StartServer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stopIecServer", nullptr, StopServer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"installCaBundle", nullptr, InstallCaBundle, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;
