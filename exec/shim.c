@@ -201,6 +201,45 @@ static void forward_pending(uint32_t remote_pid) {
     }
 }
 
+/* execve(2) closes every descriptor with FD_CLOEXEC; this route never execs,
+ * because the program runs in a child of the server. The close has to happen
+ * here instead. The descriptor that matters is run-command's exec-notify pipe:
+ * git's parent blocks reading it until EOF, and without the close the stand-in
+ * keeps the write end open, so the parent waits forever while the helper waits
+ * for a command that is never sent. Only descriptors above stderr are touched,
+ * and the service connection has no close-on-exec flag, so it survives. */
+static void close_cloexec_fds(void) {
+    long max = sysconf(_SC_OPEN_MAX);
+    int fd;
+
+    if (max < 0 || max > 4096) max = 4096;
+    for (fd = STDERR_FILENO + 1; fd < max; fd++) {
+        int flags = fcntl(fd, F_GETFD);
+        if (flags >= 0 && (flags & FD_CLOEXEC)) close(fd);
+    }
+}
+
+/* execve(2) resets every caught signal to its default disposition; only an
+ * ignored signal stays ignored. This route does not exec, so the host's
+ * handlers would otherwise survive into a process that is not the host: the
+ * app runtime's shutdown and crash handlers are the ones that matter, because
+ * they assert that they run in the main process and abort the stand-in with
+ * SIGTRAP when they do not. Reset them here, then install the handlers this
+ * side needs. */
+static void reset_signal_handlers(void) {
+    int sig;
+
+    for (sig = 1; sig < NSIG; sig++) {
+        struct sigaction old, dfl;
+        if (sigaction(sig, NULL, &old) != 0) continue;
+        if (old.sa_handler == SIG_IGN || old.sa_handler == SIG_DFL) continue;
+        memset(&dfl, 0, sizeof dfl);
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        sigaction(sig, &dfl, NULL);
+    }
+}
+
 /* Becomes the remote program's stand-in, and never returns.
  *
  * There is no way to hand a process's exit to another process, so the closest
@@ -223,6 +262,10 @@ __attribute__((noreturn)) static void become_stand_in(uint32_t remote_pid) {
     uint32_t len, state, status;
     struct timespec left, rem;
     int i;
+
+    /* execve's dispositions first, so the host's handlers cannot run in this
+     * process; see reset_signal_handlers(). */
+    reset_signal_handlers();
 
     /* Before the first request goes out: a ^C arriving in between would end this
      * process through the default action, which is the ending this whole section
@@ -474,7 +517,9 @@ static int exec_common(enum CallMethod method, const char *file,
     }
 
     /* A program is running on the server, so this call succeeds from here on: what
-     * is left is to take that program's place, which never returns. */
+     * is left is to take that program's place, which never returns. Close the
+     * descriptors execve would have closed first; see close_cloexec_fds(). */
+    close_cloexec_fds();
     become_stand_in(iec_get32(answer));
 
 too_long:

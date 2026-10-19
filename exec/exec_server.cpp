@@ -315,6 +315,25 @@ void ClearInheritedSignalMask() {
     sigprocmask(SIG_SETMASK, &empty, nullptr);
 }
 
+// execve resets every caught signal to its default disposition; an ignored
+// signal stays ignored. kExec gets that from the kernel, but the routes that do
+// not exec (kSo, kLoader) run in a child of this process and would otherwise
+// keep the app's handlers -- including the runtime's shutdown handler, which
+// asserts that it runs in the main process and aborts with SIGTRAP when it is
+// not. Do what execve would have done before entering the program.
+void ResetSignalDispositions() {
+    struct sigaction old, dfl;
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (sigaction(sig, nullptr, &old) != 0) continue;
+        if (old.sa_handler == SIG_IGN || old.sa_handler == SIG_DFL) continue;
+        memset(&dfl, 0, sizeof dfl);
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        sigaction(sig, &dfl, nullptr);
+    }
+}
+
 void ApplyRequestEnvironment(const SpawnRequest& req) {
     for (const std::string& entry : req.env) {
         const size_t eq = entry.find('=');
@@ -396,6 +415,7 @@ SpawnResult Spawn(const SpawnRequest& req) {
         // at the moment of the fork another thread may hold a stdio lock that does
         // not exist in the child; fprintf would deadlock instead of printing.
         ClearInheritedSignalMask();
+        ResetSignalDispositions();
 
         // A process group of its own, never the server's. Anything that arrives by
         // group -- a terminal's job-control signal, the tty service's kill(-pgrp) for
