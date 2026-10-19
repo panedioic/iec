@@ -36,6 +36,10 @@
 #   QEMU_SRC, GLIB_SRC, PCRE2_SRC, QEMU_PATCH_DIR
 #                               default to the copies BetterSH vendors (qemu 10.1.5 and
 #                               its patch set); point them at IEC's own once they exist.
+#   QEMU_OUT_DIR                where the objects are written (default dist/qemu).
+#   QEMU_HAR_LIBS               also copy them (with glib/intl/libffi) into this
+#                               libs/arm64-v8a directory, which is what the packaging
+#                               step needs on device. Empty by default.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,7 +51,8 @@ TARGET_OS="${TARGET_OS:-host}"
 QEMU_GUESTS="${QEMU_GUESTS:-aarch64-linux-user,x86_64-linux-user}"
 JOBS="${JOBS:-$(nproc)}"
 BUILD="$ROOT/build/qemu"
-OUT="$ROOT/dist/qemu"
+OUT="${QEMU_OUT_DIR:-$ROOT/dist/qemu}"
+HAR_LIBS="${QEMU_HAR_LIBS:-}"
 DEPS_PREFIX="$BUILD/deps"
 
 BETSH="${BETSH:-/workspace/dev/BetterSH}"
@@ -71,6 +76,7 @@ if [ "$TARGET_OS" = "ohos" ]; then
 	CROSS_AR="$OHOS_SDK/native/llvm/bin/llvm-ar"
 	CROSS_STRIP="$OHOS_SDK/native/llvm/bin/llvm-strip"
 	CROSS_RANLIB="$OHOS_SDK/native/llvm/bin/llvm-ranlib"
+	CROSS_OBJCOPY="$OHOS_SDK/native/llvm/bin/llvm-objcopy"
 	CROSS_TARGET="aarch64-linux-ohos"
 	[ -x "$CROSS_CC" ] || err "cross compiler not found: $CROSS_CC (set OHOS_SDK=)"
 	export PKG_CONFIG="pkg-config"
@@ -107,7 +113,7 @@ build_deps() {
 			-DOHOS_ARCH=arm64-v8a \
 			-DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
 			-DCMAKE_BUILD_TYPE=Release \
-			-DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON \
+			-DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON \
 			-DPCRE2_BUILD_PCRE2_8=ON -DPCRE2_BUILD_PCRE2_32=OFF \
 			-DPCRE2_BUILD_PCRE2GREP=OFF -DPCRE2_BUILD_TESTS=OFF \
 			-DPCRE2_SUPPORT_JIT=OFF \
@@ -238,9 +244,15 @@ EOF
 	# The wrap list has to stay in step with SHIM_WRAPS in the Makefile; a call left out
 	# here is a call in the guest that never reaches the service.
 	log "building the exec shim objects"
-	( cd "$ROOT" && make MODE=warp build/exec_shim.o build/sock_client.o build/rpc.o > "$BUILD/shim.log" 2>&1 ) \
+	# A separate BUILD directory, and the target compiler: the Makefile's own
+	# objects are host objects, and linking those into an aarch64 .so fails.
+	local shim_build="$BUILD/shim"
+	local shim_cc="${CROSS_CC:-cc}"
+	( cd "$ROOT" && make MODE=warp BUILD="$shim_build" CC="$shim_cc" \
+		"$shim_build/exec_shim.o" "$shim_build/sock_client.o" "$shim_build/rpc.o" \
+		> "$BUILD/shim.log" 2>&1 ) \
 		|| { tail -20 "$BUILD/shim.log" >&2; err "shim objects failed to build"; }
-	local SHIM_OBJS="$ROOT/build/exec_shim.o $ROOT/build/sock_client.o $ROOT/build/rpc.o"
+	local SHIM_OBJS="$shim_build/exec_shim.o $shim_build/sock_client.o $shim_build/rpc.o"
 	local EXEC_WRAP=""
 	for s in execve execv execvp execvpe execl execlp execle; do
 		EXEC_WRAP="$EXEC_WRAP -Wl,--wrap=$s"
@@ -251,7 +263,9 @@ EOF
 		[ -f "$src/build/$mainobj" ] || err "entry object not where it was expected: $mainobj"
 		local renamed="$BUILD/qemu_${a}_main.o"
 		cp "$src/build/$mainobj" "$renamed"
-		objcopy --redefine-sym main=qemu_main3 "$renamed" \
+		# The host binutils on Ubuntu is built for x86-64 only, so it cannot read
+		# the guest's aarch64 object; the SDK's llvm-objcopy can.
+		"${CROSS_OBJCOPY:-objcopy}" --redefine-sym main=qemu_main3 "$renamed" \
 			|| err "could not rename main in $mainobj"
 
 		# The link command ninja would have used, turned into a shared object: its own
@@ -271,25 +285,48 @@ EOF
 			|| { tail -30 "$BUILD/so-link.log" >&2; err "re-linking libqemu-$a.so failed"; }
 	done
 
-	# What the objects need at run time: glib and intl, which the device does not have.
-	# They have to sit next to the qemu objects so that dlopen finds them by SONAME.
+	# What the objects need at run time: glib, intl and libffi (the TCI backend).
+	# They have to sit next to the qemu objects so dlopen finds them by SONAME.
+	local glib_so="" ffi_so=""
 	if [ "$TARGET_OS" = "ohos" ]; then
-		local glib_so
 		glib_so=$(cd "$DEPS_PREFIX/lib" && ls libglib-2.0.so.0.* 2>/dev/null | head -1 || true)
 		[ -n "$glib_so" ] || err "libglib-2.0.so.0.* not found in $DEPS_PREFIX/lib"
 		cp -f "$DEPS_PREFIX/lib/$glib_so" "$OUT/"
 		( cd "$OUT" && ln -sf "$glib_so" libglib-2.0.so.0 )
 		[ -f "$DEPS_PREFIX/lib/libintl.so.8" ] && cp -f "$DEPS_PREFIX/lib/libintl.so.8" "$OUT/" || true
+
+		ffi_so=$(cd "$DEPS_PREFIX/lib" && ls libffi.so.7.* 2>/dev/null | head -1 || true)
+		if [ -n "$ffi_so" ]; then
+			cp -f "$DEPS_PREFIX/lib/$ffi_so" "$OUT/"
+			( cd "$OUT" && ln -sf "$ffi_so" libffi.so.7 )
+		fi
+	fi
+
+	# The HAP does not see dist/qemu: the bundle's libs/arm64 directory is the
+	# runtime search path on device. QEMU_HAR_LIBS points this step at it.
+	if [ -n "$HAR_LIBS" ]; then
+		log "copying runtime objects to $HAR_LIBS"
+		mkdir -p "$HAR_LIBS"
+		cp -f "$OUT"/libqemu-*.so "$HAR_LIBS"/
+		if [ "$TARGET_OS" = "ohos" ]; then
+			cp -f "$OUT/$glib_so" "$HAR_LIBS"/
+			( cd "$HAR_LIBS" && ln -sf "$glib_so" libglib-2.0.so.0 )
+			[ -f "$OUT/libintl.so.8" ] && cp -f "$OUT/libintl.so.8" "$HAR_LIBS"/
+			if [ -n "$ffi_so" ]; then
+				cp -f "$OUT/$ffi_so" "$HAR_LIBS"/
+				( cd "$HAR_LIBS" && ln -sf "$ffi_so" libffi.so.7 )
+			fi
+		fi
 	fi
 
 	log "artifacts:"
 	ls -l "$OUT"/*.so >&2
 	cat >&2 <<EOF
 
-The server loads these by the absolute paths written in common/constant.h, which point at
-this directory, so nothing has to be set in the environment to run it. A build for another
-machine overrides those paths (with -D on the server's compile line) rather than moving
-the files: the names here are the ones it asks for by name.
+A host build reads these from the absolute paths in common/constant.h's host defaults,
+which point at this directory. On OHOS the server looks in the bundle's libs/arm64
+directory instead: pass QEMU_HAR_LIBS=<har>/libs/arm64-v8a (or copy the files there
+yourself) before packaging.
 EOF
 }
 
