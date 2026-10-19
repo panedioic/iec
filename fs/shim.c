@@ -1040,32 +1040,6 @@ static int chmod_may_emulate(int e) {
     }
 }
 
-static int supplementary_group(gid_t g) {
-    static gid_t groups[64];
-    static int count = -1;
-    if (count < 0) count = getgroups(64, groups);
-    if (count < 0) { count = 0; return 0; }
-    for (int i = 0; i < count; i++)
-        if (groups[i] == g) return 1;
-    return 0;
-}
-
-// Does the emulated mode grant access_mask (R_OK/W_OK/X_OK, or F_OK) to this
-// process? Ownership still comes from the real stat result.
-static int mode_grants(mode_t mode, const struct stat* st, int access_mask) {
-    const int requested = access_mask & 7;
-    if (requested == 0) return 1;
-
-    const uid_t uid = geteuid();
-    if (uid == 0) return 1;
-
-    int shift = 0;
-    if (uid == st->st_uid) shift = 6;
-    else if (getegid() == st->st_gid || supplementary_group(st->st_gid)) shift = 3;
-
-    return ((((int)mode >> shift) & 7) & requested) == requested;
-}
-
 int IEC_EXPORT(chmod)(const char* path, mode_t mode) {
     if (iec_is_null(path)) { errno = EFAULT; return -1; }
 
@@ -1430,30 +1404,44 @@ int IEC_EXPORT(renameat)(int olddirfd, const char* oldpath, int newdirfd, const 
 }
 
 // ─────────────────────────── access / faccessat ───────────────────────────
+//
+// access() is answered by the kernel from the mode bits, but some filesystems
+// grant access independently: the file-manager service behind /storage/Users
+// lets open() succeed where access() says EACCES (the files are "owned" by the
+// service and the app is not in its group). When the mode check refuses R/W,
+// ask the filesystem what open() actually does. That is the same authority the
+// caller will use, and it needs no path prefix or invented ownership.
 
-// When a mode sidecar exists it is authoritative for R/W/X. Returns 1 and
-// writes *out_rc when the answer came from the sidecar, 0 to use the real call.
-static int marker_access(int dirfd, const char* path, int changed,
-                         const char* resolved, int mode, int* out_rc) {
-    char abs[IEC_BUF];
-    if (changed) {
-        if (make_abs_at(AT_FDCWD, resolved, abs, sizeof abs) != 0) return 0;
+static int access_probe_one(const char* abs, const struct stat* st, int bit) {
+    int flags;
+    if (bit == R_OK) {
+        flags = O_RDONLY | O_CLOEXEC;
+#ifdef O_DIRECTORY
+        if (S_ISDIR(st->st_mode)) flags |= O_DIRECTORY;
+#endif
+    } else if (bit == W_OK && S_ISREG(st->st_mode)) {
+        // O_NONBLOCK so a FIFO cannot hang the probe; no O_TRUNC, so the file
+        // is not modified.
+        flags = O_WRONLY | O_CLOEXEC | O_NONBLOCK;
     } else {
-        if (make_abs_at(dirfd, path, abs, sizeof abs) != 0) return 0;
+        return 0;   /* W_OK on a directory cannot be tested with open() */
     }
 
-    mode_t marker_mode;
-    if (!read_chmod_marker(abs, &marker_mode)) return 0;
+    int (*fo)(int, const char*, int, ...) = IEC_REAL(r_openat, openat);
+    if (!fo) return 0;
+    const int fd = fo(AT_FDCWD, abs, flags, 0);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
 
+static int access_probe(const char* abs, int mode) {
     struct stat st;
     int (*fs)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
-    if (!fs || fs(AT_FDCWD, abs, &st, 0) != 0) return 0;   /* gone: let the real call report it */
+    if (!fs || fs(AT_FDCWD, abs, &st, 0) != 0) return 0;
 
-    if (mode == F_OK) { *out_rc = 0; return 1; }
-    if (mode_grants(marker_mode, &st, mode)) { *out_rc = 0; return 1; }
-
-    errno = EACCES;
-    *out_rc = -1;
+    if ((mode & R_OK) && !access_probe_one(abs, &st, R_OK)) return 0;
+    if ((mode & W_OK) && !access_probe_one(abs, &st, W_OK)) return 0;
     return 1;
 }
 
@@ -1462,30 +1450,64 @@ static int do_access(int dirfd, const char* path, int mode, int flags) {
     int (*ff)(int, const char*, int, int) = IEC_REAL(r_faccessat, faccessat);
     if (!ff) { errno = ENOSYS; return -1; }
 
+    int call_dirfd = dirfd;
+    const char* call_path = path;
+    int call_flags = flags;
+    char abs[IEC_BUF];
+    int have_abs = 0;
+    char res[IEC_BUF];
+
 #ifdef AT_SYMLINK_NOFOLLOW
     if (flags & AT_SYMLINK_NOFOLLOW) {
         char cand[IEC_BUF], marker[IEC_BUF];
         int isl = 0;
         int r = last_component_cand(dirfd, path, cand, sizeof cand, marker, sizeof marker, &isl);
         if (r < 0) return -1;
-        if (r > 0) return ff(dirfd, path, mode, flags);
-        // A link's own permissions are always 0777 and it always exists → allow F_OK/R_OK/W_OK/X_OK
-        if (isl) return 0;
-        int mrc = 0;
-        if (marker_access(AT_FDCWD, cand, 1, cand, mode, &mrc)) return mrc;
-        return ff(AT_FDCWD, cand, mode, flags);
-    }
+        // A link's own permissions are always 0777 and it always exists.
+        if (r == 0 && isl) return 0;
+        if (r == 0) {
+            call_dirfd = AT_FDCWD;
+            call_path = cand;
+            have_abs = make_abs_at(AT_FDCWD, cand, abs, sizeof abs) == 0;
+        } else {
+            have_abs = make_abs_at(dirfd, path, abs, sizeof abs) == 0;
+        }
+    } else
 #endif
-    char res[IEC_BUF];
-    int changed = 0;
-    int r = resolve_at(dirfd, path, res, sizeof res, &changed);
-    if (r < 0) return -1;
+    {
+        int changed = 0;
+        int r = resolve_at(dirfd, path, res, sizeof res, &changed);
+        if (r < 0) return -1;
+        if (r == 0 && changed) {
+            call_dirfd = AT_FDCWD;
+            call_path = res;
+            call_flags = 0;
+            have_abs = make_abs_at(AT_FDCWD, res, abs, sizeof abs) == 0;
+        } else {
+            have_abs = make_abs_at(dirfd, path, abs, sizeof abs) == 0;
+        }
+    }
 
-    int mrc = 0;
-    if (marker_access(dirfd, path, changed, res, mode, &mrc)) return mrc;
+    int effective = mode;
+    if ((mode & X_OK) && have_abs) {
+        mode_t marker_mode;
+        if (read_chmod_marker(abs, &marker_mode)) {
+            if ((marker_mode & 0111) == 0) { errno = EACCES; return -1; }
+            effective &= ~X_OK;   /* the emulated execute bit is satisfied */
+        }
+    }
+    if (mode != F_OK && effective == 0) return 0;
 
-    if (r > 0 || !changed) return ff(dirfd, path, mode, flags);
-    return ff(AT_FDCWD, res, mode, 0);
+    const int rc = ff(call_dirfd, call_path, effective, call_flags);
+    if (rc == 0) return 0;
+
+    const int saved = errno;
+    if (have_abs && (saved == EACCES || saved == EPERM) &&
+        (effective & (R_OK | W_OK)) && access_probe(abs, effective))
+        return 0;
+
+    errno = saved;
+    return -1;
 }
 
 int IEC_EXPORT(access)(const char* path, int mode) {
