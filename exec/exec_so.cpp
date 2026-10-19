@@ -139,21 +139,41 @@ pid_t SpawnSo(const SpawnRequest& req) {
     // loading below does anyway, the loader's locks and all.
     SoLauncher launcher;
     std::string err;
-    if (!ResolveSoLauncher(req.path, launcher, &err)) _exit(kSoLoadFailedExit);
+    if (!ResolveSoLauncher(req.path, launcher, &err)) {
+        // The status alone cannot tell a malformed launcher from a missing object,
+        // and both are mistakes made by whoever wrote the launcher. Say which one.
+        const std::string msg = "[exec] bad launcher " + req.path + ": " + err + "\n";
+        if (write(STDERR_FILENO, msg.data(), msg.size())) {}
+        _exit(kSoLoadFailedExit);
+    }
 
     // Loaded here, in the child, so that nothing the object does becomes the server's.
     void* h = dlopen(launcher.so.c_str(), RTLD_NOW | RTLD_GLOBAL);
-    if (!h) _exit(kSoLoadFailedExit);
+    if (!h) {
+        const char* why = dlerror();
+        const std::string msg = "[exec] dlopen " + launcher.so + ": " +
+                                (why ? why : "unknown error") + "\n";
+        if (write(STDERR_FILENO, msg.data(), msg.size())) {}
+        _exit(kSoLoadFailedExit);
+    }
+
+    auto missing_entry = [&]() {
+        const char* why = dlerror();
+        const std::string msg = "[exec] dlsym " + launcher.entry + " in " +
+                                launcher.so + ": " + (why ? why : "not found") + "\n";
+        if (write(STDERR_FILENO, msg.data(), msg.size())) {}
+        _exit(kSoEntryMissingExit);
+    };
 
     using EntryFn2 = int (*)(int, char**);
     using EntryFn3 = int (*)(int, char**, char**);
     if (launcher.arity == 3) {
         auto fn3 = (EntryFn3)dlsym(h, launcher.entry.c_str());
-        if (!fn3) _exit(kSoEntryMissingExit);
+        if (!fn3) missing_entry();
         rc = fn3(argc, argv.data(), envp.data());
     } else {
         auto fn = (EntryFn2)dlsym(h, launcher.entry.c_str());
-        if (!fn) _exit(kSoEntryMissingExit);
+        if (!fn) missing_entry();
         rc = fn(argc, argv.data());
     }
 
