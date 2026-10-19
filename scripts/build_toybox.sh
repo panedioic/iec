@@ -123,7 +123,8 @@ $CC $EXTRA -O2 -fPIC -I. -I generated -c main.c -o generated/main_custom.o \
 
 # Every symbol the shims replace, plus the ones open(2) needs. The merged fs/tty
 # build has one open(), so it is listed once.
-WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat
+WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat fstat
+       chmod fchmod fchmodat
        open openat unlink unlinkat rename renameat access faccessat realpath
        link linkat opendir readdir scandir fopen freopen syscall
        close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r

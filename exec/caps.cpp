@@ -1,20 +1,22 @@
 // exec/caps.cpp — probing what this host can do.
 //
-// The four answers are taken once, before any request is served, because they
-// decide which route a program will be started by (see ResolveKind). Each probe
-// answers by observation rather than by guessing from an errno:
+// The five answers are taken once, before any request is served, because they
+// decide which route a program will be started by (see ResolveKind). Most probes
+// answer by observation rather than by guessing from an errno:
 //
-//   fork — a child writes one byte through a pipe. A signal handler installed by
-//          the host (a runtime's SIGCHLD reaper, say) can collect the child
-//          before we do, so waitpid() alone would report a false negative.
-//   path — what is visible, because that is what a rewritten absolute path has
-//          to be looked up in.
-//   exec — a forked child tries execve("/bin/sh"). The write end of the pipe is
-//          close-on-exec, so EOF means the image was replaced and a number means
-//          it was not.
-//   jit  — the code below is actually mapped and jumped into. A mapping with
-//          PROT_EXEC on it can still fault, and the only way to know is to run
-//          something. A fault is caught and turned into "no", not a crash.
+//   fork  — a child writes one byte through a pipe. A signal handler installed by
+//           the host (a runtime's SIGCHLD reaper, say) can collect the child
+//           before we do, so waitpid() alone would report a false negative.
+//   path  — what is visible, because that is what a rewritten absolute path has
+//           to be looked up in.
+//   exec  — a forked child tries execve("/bin/sh"). The write end of the pipe is
+//           close-on-exec, so EOF means the image was replaced and a number means
+//           it was not.
+//   jit   — the code below is actually mapped and jumped into. A mapping with
+//           PROT_EXEC on it can still fault, and the only way to know is to run
+//           something. A fault is caught and turned into "no", not a crash.
+//   chmod — a policy level rather than an observation: what the shims will let a
+//           guest change, limited by the device class. See ProbeChmod().
 #include "caps.h"
 
 #include <errno.h>
@@ -54,8 +56,8 @@ constexpr long kJitPrctlOpt = 0x6a6974L;
 
 void LogCaps(const char* source) {
     Logger::GetInstance()->LogI(
-        "[exec] capabilities (%s): fork=%d exec=%d jit=%d path=%d (0o%llo)",
-        source, g_caps.fork, g_caps.exec, g_caps.jit, g_caps.path,
+        "[exec] capabilities (%s): chmod=%d fork=%d exec=%d jit=%d path=%d (0x%llx)",
+        source, g_caps.chmod, g_caps.fork, g_caps.exec, g_caps.jit, g_caps.path,
         static_cast<unsigned long long>(PackCaps(g_caps)));
 }
 
@@ -108,6 +110,24 @@ static int ProbePath() {
     if (stat("/bin/sh", &st) != 0) return 0;
     if (stat("/usr", &st) == 0 && stat("/etc", &st) == 0) return 2;
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* chmod                                                              */
+/* ------------------------------------------------------------------ */
+
+// This one is policy rather than an observation: a sandbox may accept chmod on
+// files it owns while refusing it everywhere else, and whether the system user
+// directories accept it is a property of the device class. A phone or tablet is
+// therefore limited to its own tree (1). A 2in1 additionally accepts the user's
+// files (2); the app layer pins that value, because the same native library runs
+// on both. A host build can change anything (3).
+static int ProbeChmod() {
+#if defined(__OHOS__)
+    return 1;
+#else
+    return 3;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -328,7 +348,8 @@ static int ProbeJit() {
 /* ------------------------------------------------------------------ */
 
 uint64_t PackCaps(const HostCapabilities& caps) {
-    return (static_cast<uint64_t>(caps.fork & kCapMask) << kCapForkShift) |
+    return (static_cast<uint64_t>(caps.chmod & kCapMask) << kCapChmodShift) |
+           (static_cast<uint64_t>(caps.fork & kCapMask) << kCapForkShift) |
            (static_cast<uint64_t>(caps.exec & kCapMask) << kCapExecShift) |
            (static_cast<uint64_t>(caps.jit & kCapMask) << kCapJitShift) |
            (static_cast<uint64_t>(caps.path & kCapMask) << kCapPathShift);
@@ -336,6 +357,7 @@ uint64_t PackCaps(const HostCapabilities& caps) {
 
 HostCapabilities UnpackCaps(uint64_t cap) {
     HostCapabilities caps;
+    caps.chmod = static_cast<int>((cap >> kCapChmodShift) & kCapMask);
     caps.fork = static_cast<int>((cap >> kCapForkShift) & kCapMask);
     caps.exec = static_cast<int>((cap >> kCapExecShift) & kCapMask);
     caps.jit  = static_cast<int>((cap >> kCapJitShift) & kCapMask);
@@ -348,10 +370,11 @@ const HostCapabilities& Caps() {
 }
 
 uint64_t ProbeCapabilities() {
-    g_caps.fork = ProbeFork();
-    g_caps.path = ProbePath();
-    g_caps.exec = ProbeExec(g_caps.path, g_caps.fork);
-    g_caps.jit  = ProbeJit();
+    g_caps.chmod = ProbeChmod();
+    g_caps.fork  = ProbeFork();
+    g_caps.path  = ProbePath();
+    g_caps.exec  = ProbeExec(g_caps.path, g_caps.fork);
+    g_caps.jit   = ProbeJit();
 
     LogCaps("probe");
     return PackCaps(g_caps);

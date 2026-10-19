@@ -64,6 +64,13 @@
 #define IEC_SUFFIX     ".IEC_SYMLINK"
 #define IEC_SUFFIX_LEN (sizeof(IEC_SUFFIX) - 1)
 
+// A second marker, for mode changes the kernel refuses (chmod on a file owned by
+// the file-manager service, for example). Its content is the mode in octal, e.g.
+// "0755"; the file it belongs to is its name without this suffix. See the
+// "emulated chmod" section below.
+#define IEC_CHMOD_SUFFIX     ".IEC_CHMOD"
+#define IEC_CHMOD_SUFFIX_LEN (sizeof(IEC_CHMOD_SUFFIX) - 1)
+
 // Upper bound on the target string length. Real symlink(2) on Linux likewise reports
 // "target length > PATH_MAX-1 → ENAMETOOLONG" (measured: 4095 works, 5999 gives
 // ENAMETOOLONG); the same limit is used here.
@@ -110,8 +117,12 @@ static int g_marker_seen = 0;
 
 static int (*r_openat)(int, const char*, int, ...);
 static int (*r_fstatat)(int, const char*, struct stat*, int);
+static int (*r_fstat)(int, struct stat*);
 static int (*r_stat)(const char*, struct stat*);
 static int (*r_lstat)(const char*, struct stat*);
+static int (*r_chmod)(const char*, mode_t);
+static int (*r_fchmod)(int, mode_t);
+static int (*r_fchmodat)(int, const char*, mode_t, int);
 static ssize_t (*r_readlink)(const char*, char*, size_t);
 static ssize_t (*r_readlinkat)(int, const char*, char*, size_t);
 static int (*r_symlink)(const char*, const char*);
@@ -134,8 +145,12 @@ static int (*r_linkat)(int, const char*, int, const char*, int);
 #include <stdarg.h>
 extern int __real_openat(int, const char*, int, ...);
 extern int __real_fstatat(int, const char*, struct stat*, int);
+extern int __real_fstat(int, struct stat*);
 extern int __real_stat(const char*, struct stat*);
 extern int __real_lstat(const char*, struct stat*);
+extern int __real_chmod(const char*, mode_t);
+extern int __real_fchmod(int, mode_t);
+extern int __real_fchmodat(int, const char*, mode_t, int);
 extern ssize_t __real_readlink(const char*, char*, size_t);
 extern ssize_t __real_readlinkat(int, const char*, char*, size_t);
 extern int __real_symlink(const char*, const char*);
@@ -869,6 +884,271 @@ ssize_t IEC_EXPORT(readlinkat)(int dirfd, const char* path, char* buf, size_t bu
     return do_readlink(dirfd, path, buf, bufsiz);
 }
 
+// ─────────────────────────── emulated chmod (.IEC_CHMOD) ───────────────────────────
+//
+// The sandbox refuses chmod on files it does not own: /storage/Users/... is
+// presented as owned by the file-manager service, so chmod returns EPERM even
+// though the directory is writable. A sidecar file keeps the mode instead:
+//
+//     chmod foo 0755          where the kernel says EPERM
+//     -> foo.IEC_CHMOD        content "0755"
+//
+// Reads (stat/lstat/fstatat/fstat/faccessat) patch the mode from the sidecar when
+// it exists, so tools that inspect the executable bit see the change. The real
+// open/read/write path is deliberately untouched: this emulates metadata, not
+// access control. Marker creation is best effort; when even that fails the
+// original chmod errno is returned.
+
+static int chmod_marker_name(const char* path, char* out, size_t outsz) {
+    size_t n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') n--;           /* "dir/" and "dir" name the same file */
+    if (n + IEC_CHMOD_SUFFIX_LEN + 1 > outsz) { errno = ENAMETOOLONG; return -1; }
+    memcpy(out, path, n);
+    memcpy(out + n, IEC_CHMOD_SUFFIX, IEC_CHMOD_SUFFIX_LEN + 1);
+    return 0;
+}
+
+static int is_chmod_marker_name(const char* name) {
+    size_t n = strlen(name);
+    return n > IEC_CHMOD_SUFFIX_LEN &&
+           memcmp(name + n - IEC_CHMOD_SUFFIX_LEN, IEC_CHMOD_SUFFIX,
+                  IEC_CHMOD_SUFFIX_LEN) == 0;
+}
+
+static int read_chmod_marker(const char* path, mode_t* out) {
+    char marker[IEC_BUF];
+    if (chmod_marker_name(path, marker, sizeof marker) < 0) return 0;
+
+    int (*fo)(int, const char*, int, ...) = IEC_REAL(r_openat, openat);
+    if (!fo) return 0;
+    int fd = fo(AT_FDCWD, marker, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return 0;
+
+    char buf[16];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+
+    char* end = NULL;
+    unsigned long m = strtoul(buf, &end, 8);
+    if (end == buf || m > 07777) return 0;
+    *out = (mode_t)m;
+    return 1;
+}
+
+static int write_chmod_marker(const char* path, mode_t mode) {
+    char marker[IEC_BUF];
+    if (chmod_marker_name(path, marker, sizeof marker) < 0) return -1;
+
+    int (*fo)(int, const char*, int, ...) = IEC_REAL(r_openat, openat);
+    if (!fo) { errno = ENOSYS; return -1; }
+    int fd = fo(AT_FDCWD, marker,
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+
+    char buf[8];
+    int len = snprintf(buf, sizeof buf, "%04o", (unsigned)(mode & 07777));
+    ssize_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, (size_t)(len - off));
+        if (w <= 0) { int e = errno; close(fd); errno = e; return -1; }
+        off += w;
+    }
+    if (close(fd) != 0) return -1;
+    return 0;
+}
+
+static void remove_chmod_marker(const char* path) {
+    char marker[IEC_BUF];
+    if (chmod_marker_name(path, marker, sizeof marker) < 0) return;
+    int (*fu)(int, const char*, int) = IEC_REAL(r_unlinkat, unlinkat);
+    if (fu) fu(AT_FDCWD, marker, 0);
+}
+
+static void apply_chmod_marker(const char* path, struct stat* st) {
+    if (!st || S_ISLNK(st->st_mode)) return;
+    mode_t mode;
+    if (!read_chmod_marker(path, &mode)) return;
+    st->st_mode = (st->st_mode & ~(mode_t)07777) | mode;
+}
+
+// Path behind an fd, used by fchmod/fstat. Returns -1 for pipes, sockets and
+// anything else that does not name a file; "(deleted)" is stripped so a marker
+// is not created next to a name that no longer exists.
+static int fd_path(int fd, char* out, size_t outsz) {
+    char proc[64];
+    int n = snprintf(proc, sizeof proc, "/proc/self/fd/%d", fd);
+    if (n < 0 || (size_t)n >= sizeof proc) return -1;
+
+    ssize_t (*frl)(const char*, char*, size_t) = IEC_REAL(r_readlink, readlink);
+    if (!frl) return -1;
+    ssize_t len = frl(proc, out, outsz - 1);
+    if (len <= 0 || (size_t)len >= outsz) return -1;
+    out[len] = '\0';
+    if (out[0] != '/') return -1;
+
+    static const char kDeleted[] = " (deleted)";
+    const size_t dl = sizeof kDeleted - 1;
+    if ((size_t)len > dl && memcmp(out + len - dl, kDeleted, dl) == 0)
+        out[len - dl] = '\0';
+    return 0;
+}
+
+// Absolute form of (dirfd, path), for creating/looking up a marker with
+// AT_FDCWD. Relative names with AT_FDCWD are resolved against getcwd().
+static int make_abs_at(int dirfd, const char* path, char* out, size_t outsz) {
+    if (path[0] == '/') {
+        size_t n = strlen(path);
+        if (n + 1 > outsz) { errno = ENAMETOOLONG; return -1; }
+        memcpy(out, path, n + 1);
+        return 0;
+    }
+
+    char dir[IEC_BUF];
+    if (dirfd == AT_FDCWD) {
+        if (!getcwd(dir, sizeof dir)) return -1;
+    } else {
+        if (fd_path(dirfd, dir, sizeof dir) != 0) return -1;
+    }
+
+    int n = snprintf(out, outsz, "%s/%s", dir, path);
+    if (n < 0 || (size_t)n >= outsz) { errno = ENAMETOOLONG; return -1; }
+    return 0;
+}
+
+static void apply_chmod_marker_at(int dirfd, const char* path, int changed,
+                                  const char* resolved, struct stat* st) {
+    if (changed) {
+        apply_chmod_marker(resolved, st);
+        return;
+    }
+    char abs[IEC_BUF];
+    if (make_abs_at(dirfd, path, abs, sizeof abs) == 0) apply_chmod_marker(abs, st);
+}
+
+static int chmod_may_emulate(int e) {
+    switch (e) {
+        case EPERM:
+        case EACCES:
+        case EROFS:
+        case EOPNOTSUPP:
+        case ENOSYS:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int supplementary_group(gid_t g) {
+    static gid_t groups[64];
+    static int count = -1;
+    if (count < 0) count = getgroups(64, groups);
+    if (count < 0) { count = 0; return 0; }
+    for (int i = 0; i < count; i++)
+        if (groups[i] == g) return 1;
+    return 0;
+}
+
+// Does the emulated mode grant access_mask (R_OK/W_OK/X_OK, or F_OK) to this
+// process? Ownership still comes from the real stat result.
+static int mode_grants(mode_t mode, const struct stat* st, int access_mask) {
+    const int requested = access_mask & 7;
+    if (requested == 0) return 1;
+
+    const uid_t uid = geteuid();
+    if (uid == 0) return 1;
+
+    int shift = 0;
+    if (uid == st->st_uid) shift = 6;
+    else if (getegid() == st->st_gid || supplementary_group(st->st_gid)) shift = 3;
+
+    return ((((int)mode >> shift) & 7) & requested) == requested;
+}
+
+int IEC_EXPORT(chmod)(const char* path, mode_t mode) {
+    if (iec_is_null(path)) { errno = EFAULT; return -1; }
+
+    char res[IEC_BUF];
+    int changed = 0;
+    int r = resolve_at(AT_FDCWD, path, res, sizeof res, &changed);
+    if (r < 0) return -1;
+    const char* target = (r == 0 && changed) ? res : path;
+
+    int (*fc)(const char*, mode_t) = IEC_REAL(r_chmod, chmod);
+    if (!fc) { errno = ENOSYS; return -1; }
+
+    if (fc(target, mode) == 0) {
+        remove_chmod_marker(target);
+        return 0;
+    }
+
+    const int saved = errno;
+    if (!chmod_may_emulate(saved)) { errno = saved; return -1; }
+
+    char abs[IEC_BUF];
+    if (make_abs_at(AT_FDCWD, target, abs, sizeof abs) != 0 ||
+        write_chmod_marker(abs, mode) != 0) {
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
+int IEC_EXPORT(fchmod)(int fd, mode_t mode) {
+    int (*fc)(int, mode_t) = IEC_REAL(r_fchmod, fchmod);
+    if (!fc) { errno = ENOSYS; return -1; }
+
+    if (fc(fd, mode) == 0) {
+        char path[IEC_BUF];
+        if (fd_path(fd, path, sizeof path) == 0) remove_chmod_marker(path);
+        return 0;
+    }
+
+    const int saved = errno;
+    if (!chmod_may_emulate(saved)) { errno = saved; return -1; }
+
+    char path[IEC_BUF];
+    if (fd_path(fd, path, sizeof path) != 0 || write_chmod_marker(path, mode) != 0) {
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
+int IEC_EXPORT(fchmodat)(int dirfd, const char* path, mode_t mode, int flags) {
+    if (iec_is_null(path)) { errno = EFAULT; return -1; }
+    int (*fc)(int, const char*, mode_t, int) = IEC_REAL(r_fchmodat, fchmodat);
+    if (!fc) { errno = ENOSYS; return -1; }
+
+    // chmod has no "do not follow" form on Linux; leave the flags to the real
+    // implementation (it reports EOPNOTSUPP) rather than inventing semantics.
+    if (flags != 0) return fc(dirfd, path, mode, flags);
+
+    char res[IEC_BUF];
+    int changed = 0;
+    int r = resolve_at(dirfd, path, res, sizeof res, &changed);
+    if (r < 0) return -1;
+    const char* target = (r == 0 && changed) ? res : path;
+
+    int rc = changed ? fc(AT_FDCWD, res, mode, 0) : fc(dirfd, path, mode, 0);
+    if (rc == 0) {
+        remove_chmod_marker(target);
+        return 0;
+    }
+
+    const int saved = errno;
+    if (!chmod_may_emulate(saved)) { errno = saved; return -1; }
+
+    char abs[IEC_BUF];
+    if (make_abs_at(dirfd, target, abs, sizeof abs) != 0 ||
+        write_chmod_marker(abs, mode) != 0) {
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
 // ─────────────────────────── lstat / stat / fstatat ───────────────────────────
 
 int IEC_EXPORT(lstat)(const char* path, struct stat* buf) {
@@ -887,8 +1167,9 @@ int IEC_EXPORT(lstat)(const char* path, struct stat* buf) {
     if (r == 0 && isl) return fill_link_stat(marker, buf);
     int (*fl)(const char*, struct stat*) = IEC_REAL(r_lstat, lstat);
     if (!fl) { errno = ENOSYS; return -1; }
-    if (r > 0) return fl(path, buf);
-    return fl(cand, buf);
+    int rc = (r > 0) ? fl(path, buf) : fl(cand, buf);
+    if (rc == 0) apply_chmod_marker_at(AT_FDCWD, path, r == 0, cand, buf);
+    return rc;
 }
 
 int IEC_EXPORT(stat)(const char* path, struct stat* buf) {
@@ -900,7 +1181,9 @@ int IEC_EXPORT(stat)(const char* path, struct stat* buf) {
     if (r < 0) return -1;
     int (*fs)(const char*, struct stat*) = IEC_REAL(r_stat, stat);
     if (!fs) { errno = ENOSYS; return -1; }
-    return fs(changed ? res : path, buf);
+    int rc = fs(changed ? res : path, buf);
+    if (rc == 0) apply_chmod_marker_at(AT_FDCWD, path, changed, res, buf);
+    return rc;
 }
 
 int IEC_EXPORT(fstatat)(int dirfd, const char* path, struct stat* buf, int flags) {
@@ -915,8 +1198,9 @@ int IEC_EXPORT(fstatat)(int dirfd, const char* path, struct stat* buf, int flags
         if (r == 0 && isl) return fill_link_stat(marker, buf);
         int (*ff)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
         if (!ff) { errno = ENOSYS; return -1; }
-        if (r > 0) return ff(dirfd, path, buf, flags);
-        return ff(AT_FDCWD, cand, buf, flags);
+        int rc = (r > 0) ? ff(dirfd, path, buf, flags) : ff(AT_FDCWD, cand, buf, flags);
+        if (rc == 0) apply_chmod_marker_at(dirfd, path, r == 0, cand, buf);
+        return rc;
     }
 #endif
     char res[IEC_BUF];
@@ -925,8 +1209,23 @@ int IEC_EXPORT(fstatat)(int dirfd, const char* path, struct stat* buf, int flags
     if (r < 0) return -1;
     int (*ff)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
     if (!ff) { errno = ENOSYS; return -1; }
-    if (r > 0 || !changed) return ff(dirfd, path, buf, flags);
-    return ff(AT_FDCWD, res, buf, flags);
+    int rc = (r > 0 || !changed) ? ff(dirfd, path, buf, flags) : ff(AT_FDCWD, res, buf, flags);
+    if (rc == 0) apply_chmod_marker_at(dirfd, path, changed, res, buf);
+    return rc;
+}
+
+// The fd variant matters after a chmod on a file that is already open: tools ask
+// fstat() for the mode they just set (toybox's cp -p does).
+int IEC_EXPORT(fstat)(int fd, struct stat* buf) {
+    if (iec_is_null(buf)) { errno = EFAULT; return -1; }
+    int (*ff)(int, struct stat*) = IEC_REAL(r_fstat, fstat);
+    if (!ff) { errno = ENOSYS; return -1; }
+    int rc = ff(fd, buf);
+    if (rc == 0) {
+        char path[IEC_BUF];
+        if (fd_path(fd, path, sizeof path) == 0) apply_chmod_marker(path, buf);
+    }
+    return rc;
 }
 
 // ─────────────────────────── open / openat ───────────────────────────
@@ -1036,7 +1335,10 @@ static int do_unlink(int dirfd, const char* path, int atflags) {
     if (r < 0) return -1;
     if (r > 0) return fu(dirfd, path, atflags);
     if (isl) return fu(AT_FDCWD, marker, 0);
-    return fu(AT_FDCWD, cand, atflags);
+
+    int rc = fu(AT_FDCWD, cand, atflags);
+    if (rc == 0) remove_chmod_marker(cand);   /* a deleted file must not keep its mode sidecar */
+    return rc;
 }
 
 int IEC_EXPORT(unlink)(const char* path) {
@@ -1060,6 +1362,23 @@ int IEC_EXPORT(unlinkat)(int dirfd, const char* path, int atflags) {
 //                         overwrite that link with the source file), then do the real rename —
 //                         otherwise it becomes a fake link whose content is treated as the target string
 //   ordinary → ordinary   pass through verbatim
+// Move the mode sidecar with its file. A destination sidecar is removed first:
+// it described the file that is being replaced, not the one arriving.
+static void move_chmod_marker(const char* oldp, const char* newp) {
+    char om[IEC_BUF], nm[IEC_BUF];
+    if (chmod_marker_name(oldp, om, sizeof om) < 0 ||
+        chmod_marker_name(newp, nm, sizeof nm) < 0) return;
+
+    int (*fu)(int, const char*, int) = IEC_REAL(r_unlinkat, unlinkat);
+    int (*fr)(const char*, const char*) = IEC_REAL(r_rename, rename);
+    int (*fs)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
+    if (!fu || !fr || !fs) return;
+
+    fu(AT_FDCWD, nm, 0);
+    struct stat st;
+    if (fs(AT_FDCWD, om, &st, AT_SYMLINK_NOFOLLOW) == 0) fr(om, nm);
+}
+
 static int do_rename(int od, const char* oldp, int nd, const char* newp) {
     if (!oldp || !newp) { errno = EFAULT; return -1; }
     int (*fr)(const char*, const char*) = IEC_REAL(r_rename, rename);
@@ -1077,7 +1396,12 @@ static int do_rename(int od, const char* oldp, int nd, const char* newp) {
     if (nr_ < 0) return -1;
 
     if (or_ > 0 || nr_ > 0) return fr(oldp, newp);   // cannot normalize → real rename
-    if (!oisl && !nisl) return fr(ocand, ncand);     // no links involved → real rename (namespace already fixed up)
+
+    if (!oisl && !nisl) {                            // no links involved → real rename
+        int rc = fr(ocand, ncand);
+        if (rc == 0) move_chmod_marker(ocand, ncand);
+        return rc;
+    }
 
     if (fu) {
         if (oisl && !nisl) fu(AT_FDCWD, ncand, 0);   // remove the real same-named file at the destination
@@ -1087,7 +1411,14 @@ static int do_rename(int od, const char* oldp, int nd, const char* newp) {
     const char* src = oisl ? omark : ocand;
     char dst[IEC_BUF];
     if (marker_name(ncand, dst, sizeof dst) < 0) return -1;
-    return fr(src, dst);
+    int rc = fr(src, dst);
+    if (rc == 0) {
+        // The visible destination is a link (or the source was one): a mode
+        // sidecar belongs to neither, so drop both leftovers.
+        remove_chmod_marker(ncand);
+        remove_chmod_marker(ocand);
+    }
+    return rc;
 }
 
 int IEC_EXPORT(rename)(const char* oldpath, const char* newpath) {
@@ -1099,6 +1430,32 @@ int IEC_EXPORT(renameat)(int olddirfd, const char* oldpath, int newdirfd, const 
 }
 
 // ─────────────────────────── access / faccessat ───────────────────────────
+
+// When a mode sidecar exists it is authoritative for R/W/X. Returns 1 and
+// writes *out_rc when the answer came from the sidecar, 0 to use the real call.
+static int marker_access(int dirfd, const char* path, int changed,
+                         const char* resolved, int mode, int* out_rc) {
+    char abs[IEC_BUF];
+    if (changed) {
+        if (make_abs_at(AT_FDCWD, resolved, abs, sizeof abs) != 0) return 0;
+    } else {
+        if (make_abs_at(dirfd, path, abs, sizeof abs) != 0) return 0;
+    }
+
+    mode_t marker_mode;
+    if (!read_chmod_marker(abs, &marker_mode)) return 0;
+
+    struct stat st;
+    int (*fs)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
+    if (!fs || fs(AT_FDCWD, abs, &st, 0) != 0) return 0;   /* gone: let the real call report it */
+
+    if (mode == F_OK) { *out_rc = 0; return 1; }
+    if (mode_grants(marker_mode, &st, mode)) { *out_rc = 0; return 1; }
+
+    errno = EACCES;
+    *out_rc = -1;
+    return 1;
+}
 
 static int do_access(int dirfd, const char* path, int mode, int flags) {
     if (!path) { errno = EFAULT; return -1; }
@@ -1114,6 +1471,8 @@ static int do_access(int dirfd, const char* path, int mode, int flags) {
         if (r > 0) return ff(dirfd, path, mode, flags);
         // A link's own permissions are always 0777 and it always exists → allow F_OK/R_OK/W_OK/X_OK
         if (isl) return 0;
+        int mrc = 0;
+        if (marker_access(AT_FDCWD, cand, 1, cand, mode, &mrc)) return mrc;
         return ff(AT_FDCWD, cand, mode, flags);
     }
 #endif
@@ -1121,6 +1480,10 @@ static int do_access(int dirfd, const char* path, int mode, int flags) {
     int changed = 0;
     int r = resolve_at(dirfd, path, res, sizeof res, &changed);
     if (r < 0) return -1;
+
+    int mrc = 0;
+    if (marker_access(dirfd, path, changed, res, mode, &mrc)) return mrc;
+
     if (r > 0 || !changed) return ff(dirfd, path, mode, flags);
     return ff(AT_FDCWD, res, mode, 0);
 }
@@ -1217,9 +1580,13 @@ DIR* IEC_EXPORT(opendir)(const char* path) {
 struct dirent* IEC_EXPORT(readdir)(DIR* dirp) {
     struct dirent* (*fr)(DIR*) = IEC_REAL(r_readdir, readdir);
     if (!fr) { errno = ENOSYS; return NULL; }
-    struct dirent* e = fr(dirp);
-    if (e) unmark_dirent(e);
-    return e;
+    for (;;) {
+        struct dirent* e = fr(dirp);
+        if (!e) return NULL;
+        if (is_chmod_marker_name(e->d_name)) continue;   /* metadata, not a user entry */
+        unmark_dirent(e);
+        return e;
+    }
 }
 
 #ifdef __GLIBC__
@@ -1250,8 +1617,17 @@ int IEC_EXPORT(scandir)(const char* path, struct dirent*** namelist,
     if (!fsc) { errno = ENOSYS; return -1; }
     int n = fsc(changed ? res : path, namelist, filter, compar);
     if (n > 0 && !iec_is_null(namelist) && *namelist) {
-        for (int i = 0; i < n; i++)
-            if ((*namelist)[i]) unmark_dirent((*namelist)[i]);
+        int kept = 0;
+        for (int i = 0; i < n; i++) {
+            struct dirent* e = (*namelist)[i];
+            if (e && is_chmod_marker_name(e->d_name)) {
+                free(e);                              /* hidden metadata file */
+                continue;
+            }
+            if (e) unmark_dirent(e);
+            (*namelist)[kept++] = e;
+        }
+        n = kept;
     }
     return n;
 }
@@ -1385,7 +1761,11 @@ static int link_or_copy(int od, const char* oldp, int nd, const char* newp, int 
     if (src < 0) return -1;
     int dst = fop(nd, newp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, (mode_t)(st.st_mode & 07777));
     if (dst < 0) { int e = errno; close(src); errno = e; return -1; }
-    fchmod(dst, (mode_t)(st.st_mode & 07777));   /* O_CREAT's mode is trimmed by umask; restore it explicitly */
+    /* O_CREAT's mode is trimmed by umask; restore it explicitly. Call the real
+     * fchmod: the wrapper below is this shim's own and would consult the chmod
+     * policy for an operation the fallback has to complete. */
+    int (*ffchmod)(int, mode_t) = IEC_REAL(r_fchmod, fchmod);
+    if (ffchmod) ffchmod(dst, (mode_t)(st.st_mode & 07777));
     char buf[65536];
     int rc = 0;
     for (;;) {

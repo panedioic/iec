@@ -121,8 +121,13 @@ LaunchKind ResolveKind(const std::string& path) {
     const uint16_t machine = ElfMachine(path);
     const bool host_arch = machine == HOST_ARCH;
 
+    // An executable bit that exists only in <path>.IEC_CHMOD is not visible to
+    // execve(): the kernel will still see the old mode and fail. Route such a
+    // file through a loader that does not ask the kernel about the bit.
+    const bool emulated_exec = EmulatedExecutable(path);
+
     if (host_arch && caps.fork == 1) {
-        if (caps.exec == 2) return LaunchKind::kExec;
+        if (caps.exec == 2 && !emulated_exec) return LaunchKind::kExec;
         if (caps.jit > 0) return LaunchKind::kLoader;
     }
 

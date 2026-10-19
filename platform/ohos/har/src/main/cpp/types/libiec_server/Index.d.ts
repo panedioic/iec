@@ -1,6 +1,7 @@
 // ArkTS declaration for libiec_server.so (must match the exports in napi_init.cpp).
 export interface Caps {
   packed: number;
+  chmod: number;
   fork: number;
   exec: number;
   jit: number;

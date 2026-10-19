@@ -140,7 +140,8 @@ $CC_TARGET "${SHIM_CFLAGS[@]}" -c "$IEC_ROOT/exec/shim.c" -o "$BUILD/iec_exec_sh
 $CC_TARGET "${SHIM_CFLAGS[@]}" -c "$IEC_ROOT/common/rpc.c" -o "$BUILD/iec_rpc.o"
 $CC_TARGET "${SHIM_CFLAGS[@]}" -c "$IEC_ROOT/common/sock_client.c" -o "$BUILD/iec_sock_client.o"
 
-WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat
+WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat fstat
+       chmod fchmod fchmodat
        open openat unlink unlinkat rename renameat access faccessat realpath
        link linkat opendir readdir scandir fopen freopen syscall
        close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r

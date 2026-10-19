@@ -7,6 +7,9 @@
 // definitions stay where they belong, next to the code that owns them.
 #pragma once
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include <string>
 #include <vector>
 
@@ -21,6 +24,15 @@ std::string UnderFakeRoot(const std::string& path);
 // empty when nothing matches. Runs in the parent, before the fork.
 std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env,
                             const std::string& cwd);
+
+// The mode the fs shim stored in <path>.IEC_CHMOD when the kernel refused a
+// chmod. These three are how the server honours an emulated executable bit:
+// ReadChmodMarker reads it, ModeAllowsExec applies the usual uid/gid rules,
+// and EmulatedExecutable is the "does this file only look executable because
+// of a sidecar?" question that routing asks before choosing kExec.
+bool ReadChmodMarker(const std::string& path, mode_t* mode);
+bool ModeAllowsExec(mode_t mode, const struct stat& st);
+bool EmulatedExecutable(const std::string& path);
 
 // How a program of this host is started; see exec_types.h for what the kinds mean.
 LaunchKind ResolveKind(const std::string& path);

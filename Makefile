@@ -35,8 +35,8 @@ TREE_PATHS    := -DFAKE_SYSROOT=\"$(FAKE_SYSROOT)\" \
                  -DPATH_QEMU_AARCH64_SO=\"$(QEMU_DIR)/libqemu-aarch64.so\"
 
 # main.cpp pins this capability word. Override it to exercise other routes,
-# e.g. `make server PINNED_CAPS=01032` for fork=1, jit=3, path=2 (kLoader).
-PINNED_CAPS ?= 01000
+# e.g. `make server PINNED_CAPS=0x11032` for chmod=1, fork=1, jit=3, path=2 (kLoader).
+PINNED_CAPS ?= 0x11000
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),x86_64)
   GUEST_SWITCH_SRC := loader/guest_switch_x86_64.S

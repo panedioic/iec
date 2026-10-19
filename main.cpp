@@ -13,11 +13,11 @@ static TtyServer*  g_tty_server  = nullptr;
 static ExecServer* g_exec_server = nullptr;
 static volatile sig_atomic_t g_stop = 0;
 
-// The capability word this build pins. The default means fork=1 and
-// exec=jit=path=0; a test build can pass e.g. -DIEC_PINNED_CAPS=01032 to
-// exercise the loader route (fork=1, jit=3, path=2).
+// The capability word this build pins. The default means chmod=1, fork=1 and
+// exec=jit=path=0; a test build can pass e.g. -DIEC_PINNED_CAPS=0x11032 to
+// exercise the loader route (chmod=1, fork=1, jit=3, path=2).
 #ifndef IEC_PINNED_CAPS
-#define IEC_PINNED_CAPS 01000
+#define IEC_PINNED_CAPS 0x11000
 #endif
 
 // Runs in signal context, so the only thing it may do is set flags: joining a
@@ -35,8 +35,8 @@ int main(int argc, char** argv) {
     const char* tty_path  = argc > 1 ? argv[1] : TTY_SOCK_PATH;
     const char* exec_path = argc > 2 ? argv[2] : EXEC_SOCK_PATH;
 
-    // C++ has no 0o prefix: the default 01000 is octal 1000, meaning fork=1
-    // and exec=jit=path=0. See IEC_PINNED_CAPS above for test overrides.
+    // 0x11000 means chmod=1 (sandbox only), fork=1 and exec=jit=path=0.
+    // See IEC_PINNED_CAPS above for test overrides.
     setCaps(IEC_PINNED_CAPS);
 
     try {

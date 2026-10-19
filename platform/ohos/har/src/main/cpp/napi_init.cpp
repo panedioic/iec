@@ -31,8 +31,8 @@
 
 namespace {
 
-// The ArkTS shape shared by setCaps() and probeCaps(). packed is the four-digit
-// octal value; the other fields are its digits.
+// The ArkTS shape shared by setCaps() and probeCaps(). packed is the five-digit
+// hexadecimal value; the other fields are its digits.
 napi_value MakeCaps(napi_env env, uint64_t packed) {
     const HostCapabilities caps = UnpackCaps(packed);
 
@@ -43,6 +43,8 @@ napi_value MakeCaps(napi_env env, uint64_t packed) {
     napi_create_double(env, static_cast<double>(packed), &value);
     napi_set_named_property(env, obj, "packed", value);
 
+    napi_create_int32(env, caps.chmod, &value);
+    napi_set_named_property(env, obj, "chmod", value);
     napi_create_int32(env, caps.fork, &value);
     napi_set_named_property(env, obj, "fork", value);
     napi_create_int32(env, caps.exec, &value);

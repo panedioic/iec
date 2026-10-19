@@ -30,8 +30,8 @@ set(IEC_FAKE_SYSROOT "${CMAKE_CURRENT_SOURCE_DIR}/dist/fake_sysroot"
     CACHE PATH "Where absolute paths are rewritten when the PATH capability is 0")
 set(IEC_QEMU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/qemu"
     CACHE PATH "Directory holding libqemu-<guest>.so")
-set(IEC_PINNED_CAPS "01000"
-    CACHE STRING "Capability word pinned by main.cpp; e.g. 01032 to exercise kLoader")
+set(IEC_PINNED_CAPS "0x11000"
+    CACHE STRING "Capability word pinned by main.cpp; e.g. 0x11032 to exercise kLoader")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     set(IEC_GUEST_SWITCH loader/guest_switch_x86_64.S)

@@ -1,14 +1,15 @@
 // exec/caps.h — what this host can do, and the one word the probes are packed into.
 //
-// The four answers decide how a program is started (see ResolveKind in
+// The five answers decide how a program is started (see ResolveKind in
 // exec_server.cpp), so they are taken once at start-up and read from here after
-// that. Each field is one octal digit -- three bits -- in the packed word:
+// that. Each field is one hexadecimal digit -- four bits -- in the packed word:
 //
-//     fork << 9 | exec << 6 | jit << 3 | path
+//     chmod << 16 | fork << 12 | exec << 8 | jit << 4 | path
 //
-// written as four octal digits. 0o1232 therefore means fork=1, exec=2, jit=3,
-// path=2; 0o1000 means fork=1 and everything else zero. (C++ spells those
-// 01232 and 01000 -- it has no 0o prefix; 0o is this comment's notation.) The
+// written as five hexadecimal digits. 0x12322 therefore means chmod=1, fork=2,
+// exec=3, jit=2, path=2; 0x11030 means chmod=1, fork=1, jit=3 and everything
+// else zero. Hexadecimal rather than the earlier octal packing is used so the
+// same word can be written as 0x... from C, C++, ArkTS and scripts alike. The
 // packing exists so the whole answer can be written down as one number --
 // logged at start-up, or carried in a bug report -- without a struct having to
 // travel with it.
@@ -17,6 +18,11 @@
 #include <cstdint>
 
 struct HostCapabilities {
+    /* CHMOD: how far the host's own chmod reaches. 0 = nowhere, 1 = only inside
+     * the application sandbox, 2 = also inside the system user directories (for
+     * example /storage/Users/currentUser), 3 = anywhere. */
+    int chmod = 0;
+
     /* FORK: 0 = fork is unavailable, 1 = fork + waitpid work. */
     int fork = 0;
 
@@ -36,11 +42,12 @@ struct HostCapabilities {
     int path = 0;
 };
 
-constexpr int kCapForkShift = 9;
-constexpr int kCapExecShift = 6;
-constexpr int kCapJitShift  = 3;
-constexpr int kCapPathShift = 0;
-constexpr uint64_t kCapMask = 0x7;
+constexpr int kCapChmodShift = 16;
+constexpr int kCapForkShift  = 12;
+constexpr int kCapExecShift  = 8;
+constexpr int kCapJitShift   = 4;
+constexpr int kCapPathShift  = 0;
+constexpr uint64_t kCapMask = 0xF;
 
 uint64_t PackCaps(const HostCapabilities& caps);
 HostCapabilities UnpackCaps(uint64_t cap);

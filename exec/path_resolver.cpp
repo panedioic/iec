@@ -11,6 +11,7 @@
 #include "constant.h"
 #include "fs/resolver.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -26,6 +27,14 @@ bool IsExecutableFile(const std::string& path) {
 
     if (stat(path.c_str(), &st) != 0) return false;
     if (!S_ISREG(st.st_mode)) return false;
+
+    // When the native chmod is unreliable, the fs shim's sidecar is the only
+    // truthful source for the executable bit; if it exists it also wins over
+    // the kernel's (unchanged) mode.
+    mode_t mode = 0;
+    if (Caps().chmod < 3 && ReadChmodMarker(path, &mode))
+        return ModeAllowsExec(mode, st);
+
     return access(path.c_str(), X_OK) == 0;
 }
 
@@ -143,4 +152,53 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
         start = colon + 1;
     }
     return std::string();
+}
+
+bool ReadChmodMarker(const std::string& path, mode_t* mode) {
+    const std::string marker = path + ".IEC_CHMOD";
+    const int fd = open(marker.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+
+    char buf[16];
+    const ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return false;
+
+    buf[n] = '\0';
+    char* end = nullptr;
+    const unsigned long m = strtoul(buf, &end, 8);
+    if (end == buf || m > 07777) return false;
+
+    *mode = static_cast<mode_t>(m);
+    return true;
+}
+
+bool ModeAllowsExec(mode_t mode, const struct stat& st) {
+    if ((mode & 0111) == 0) return false;
+
+    const uid_t uid = geteuid();
+    if (uid == 0) return true;
+    if (st.st_uid == uid) return (mode & S_IXUSR) != 0;
+    if (st.st_gid == getegid()) return (mode & S_IXGRP) != 0;
+
+    const int n = getgroups(0, nullptr);
+    if (n > 0) {
+        std::vector<gid_t> groups(static_cast<size_t>(n));
+        if (getgroups(n, groups.data()) == n) {
+            for (const gid_t g : groups)
+                if (g == st.st_gid) return (mode & S_IXGRP) != 0;
+        }
+    }
+    return (mode & S_IXOTH) != 0;
+}
+
+bool EmulatedExecutable(const std::string& path) {
+    if (Caps().chmod >= 3) return false;
+
+    mode_t mode = 0;
+    if (!ReadChmodMarker(path, &mode)) return false;
+
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    return ModeAllowsExec(mode, st);
 }

@@ -135,7 +135,8 @@ log "rename main -> iec_dropbear_main"
 	"$BUILD/obj/dbmulti.o" "$BUILD/obj/dbmulti_iec.o"
 rm -f "$BUILD/obj/dbmulti.o"
 
-WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat
+WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat fstat
+       chmod fchmod fchmodat
        open openat unlink unlinkat rename renameat access faccessat realpath
        link linkat opendir readdir scandir fopen freopen syscall
        close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r
