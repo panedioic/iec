@@ -13,10 +13,10 @@
 #   2. renames the `main` in common-main.o to iec_git_main;
 #   3. links git.o + builtin/*.o + libgit.a + IEC shims into libgit.so.
 #
-# What it does not package yet:
-#   * git-remote-http / git-remote-https (remote-curl is a second program);
-#   * templates, the CA bundle, and the runtime GIT_EXEC_PATH layout.
-#   A basic `git --version` / `git init` / `git status` needs none of those.
+# What it also produces:
+#   * libgit-remote-http.so, the second program upstream (remote-curl);
+#   * the CA bundle is embedded in the IEC HAR, see common/ca_bundle.cpp;
+#   * templates are written by the application's bootstrap.
 #
 # Usage:
 #   scripts/optional/build_git.sh
@@ -24,8 +24,10 @@
 #
 # Output:
 #   platform/ohos/har/libs/arm64-v8a/libgit.so
-# Entry:
+#   platform/ohos/har/libs/arm64-v8a/libgit-remote-http.so
+# Entries:
 #   iec_git_main (arity 2)
+#   iec_git_remote_http_main (arity 2)
 set -euo pipefail
 
 IEC_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -83,6 +85,11 @@ log "build pthread cancellation stubs"
 $CC_TARGET -O2 -fPIC -c "$IEC_ROOT/compat/pthread_cancel_stub.c" \
 	-o "$BUILD/pthread_cancel_stub.o"
 
+# exit() in a fork() of the app would run the host's atexit handlers; see the
+# comment in compat/exit_wrap.c.
+$CC_TARGET -O2 -fPIC -c "$IEC_ROOT/compat/exit_wrap.c" \
+	-o "$BUILD/exit_wrap.o"
+
 log "build git objects (-fPIC)"
 make -C "$GIT_SRC" -j"$JOBS" \
 	prefix=/usr \
@@ -103,18 +110,25 @@ make -C "$GIT_SRC" -j"$JOBS" \
 	CURL_CFLAGS="-I$CURL_PREFIX/include" \
 	CURL_LDFLAGS="-L$CURL_PREFIX/lib -lcurl -lssl -lcrypto -lz" \
 	CURL_CONFIG="$CURL_PREFIX/bin/curl-config" \
-	git > "$BUILD/git-make.log" 2>&1 \
+	git git-remote-http > "$BUILD/git-make.log" 2>&1 \
 	|| { tail -50 "$BUILD/git-make.log" >&2; err "git build failed (see $BUILD/git-make.log)"; }
 
 [ -f "$GIT_SRC/git.o" ] || err "git.o was not produced"
 [ -f "$GIT_SRC/libgit.a" ] || err "libgit.a was not produced"
 [ -f "$GIT_SRC/common-main.o" ] || err "common-main.o was not produced"
+[ -f "$GIT_SRC/remote-curl.o" ] || err "remote-curl.o was not produced"
 
 log "rename main -> iec_git_main"
 "$OBJCOPY" --redefine-sym main=iec_git_main \
 	"$GIT_SRC/common-main.o" "$BUILD/common-main-iec.o"
 "$NM" "$BUILD/common-main-iec.o" | grep ' T iec_git_main$' >/dev/null \
 	|| err "iec_git_main was not created"
+
+log "rename common-main for the remote helper"
+"$OBJCOPY" --redefine-sym main=iec_git_remote_http_main \
+	"$GIT_SRC/common-main.o" "$BUILD/common-main-http-iec.o"
+"$NM" "$BUILD/common-main-http-iec.o" | grep ' T iec_git_remote_http_main$' >/dev/null \
+	|| err "iec_git_remote_http_main was not created"
 
 # IEC's client-side shims: the linked program's open/stat/execve calls go to the
 # services, and tty/shim.c supplies the single open() entry for both modules.
@@ -132,7 +146,8 @@ WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat
        close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r
        tcgetattr tcsetattr tcgetpgrp tcsetpgrp getpt grantpt unlockpt ptsname
        openpty login_tty forkpty
-       execve execv execvp execvpe execl execlp execle)
+       execve execv execvp execvpe execl execlp execle
+       exit)
 WRAP_FLAGS=()
 for name in "${WRAPS[@]}"; do
 	WRAP_FLAGS+=("-Wl,--wrap=$name")
@@ -146,13 +161,15 @@ BUILTIN_OBJS=$(find "$GIT_SRC/builtin" -name '*.o' -print)
 log "link $OUT"
 # shellcheck disable=SC2086
 $CC_TARGET -fuse-ld=lld -shared -o "$OUT" \
-	"$BUILD/common-main-iec.o" "$GIT_SRC/git.o" $BUILTIN_OBJS \
-	"$GIT_SRC/libgit.a" "$BUILD/pthread_cancel_stub.o" \
+	"$BUILD/common-main-iec.o" \
+	"$GIT_SRC/git.o" $BUILTIN_OBJS \
+	"$GIT_SRC/libgit.a" "$BUILD/pthread_cancel_stub.o" "$BUILD/exit_wrap.o" \
 	"$BUILD/iec_tty_shim.o" "$BUILD/iec_fs_shim.o" \
 	"$BUILD/iec_exec_shim.o" "$BUILD/iec_rpc.o" "$BUILD/iec_sock_client.o" \
 	-L"$DEPS_LIB" -L"$OPENSSL/lib" -L"$CURL_PREFIX/lib" \
 	-lcurl -lssl -lcrypto -lz -lpcre2-8 -lpthread -ldl -lm \
-	-Wl,-soname,libgit.so "${WRAP_FLAGS[@]}"
+	-Wl,-soname,libgit.so "${WRAP_FLAGS[@]}" \
+	-Wl,-Bsymbolic-functions
 
 "$NM" -D "$OUT" | grep ' iec_git_main$' >/dev/null \
 	|| err "iec_git_main is not exported"
@@ -161,16 +178,41 @@ if "$NM" -D -u "$OUT" | grep -E '__wrap_|__real_' >/dev/null; then
 fi
 
 "$READELF" -d "$OUT" | grep -E 'NEEDED|SONAME' >&2
+
+# git-remote-http is a separate program upstream because both it and git define
+# cmd_main. Keep that shape: its own object, its own entry, its own .so. http.o
+# and http-walker.o are not part of libgit.a on purpose -- upstream links them
+# only into the remote helper -- so they have to be named here too.
+OUT_HELPER="$OUTDIR/libgit-remote-http.so"
+log "link $OUT_HELPER"
+$CC_TARGET -fuse-ld=lld -shared -o "$OUT_HELPER" \
+	"$BUILD/common-main-http-iec.o" "$GIT_SRC/remote-curl.o" \
+	"$GIT_SRC/http.o" "$GIT_SRC/http-walker.o" \
+	"$GIT_SRC/libgit.a" "$BUILD/pthread_cancel_stub.o" "$BUILD/exit_wrap.o" \
+	"$BUILD/iec_tty_shim.o" "$BUILD/iec_fs_shim.o" \
+	"$BUILD/iec_exec_shim.o" "$BUILD/iec_rpc.o" "$BUILD/iec_sock_client.o" \
+	-L"$DEPS_LIB" -L"$OPENSSL/lib" -L"$CURL_PREFIX/lib" \
+	-lcurl -lssl -lcrypto -lz -lpcre2-8 -lpthread -ldl -lm \
+	-Wl,-soname,libgit-remote-http.so "${WRAP_FLAGS[@]}" \
+	-Wl,-Bsymbolic-functions
+
+"$NM" -D "$OUT_HELPER" | grep ' iec_git_remote_http_main$' >/dev/null \
+	|| err "iec_git_remote_http_main is not exported"
+if "$NM" -D -u "$OUT_HELPER" | grep -E '__wrap_|__real_' >/dev/null; then
+	err "unresolved __wrap_/__real_ symbols in the remote helper"
+fi
+"$READELF" -d "$OUT_HELPER" | grep -E 'NEEDED|SONAME' >&2
+
 log "done: $OUT ($(du -h "$OUT" | cut -f1))"
+log "done: $OUT_HELPER ($(du -h "$OUT_HELPER" | cut -f1))"
 cat >&2 <<EOF
 
-To try it on device, write this launcher to <fake root>/bin/git:
+To try it on device, the app bootstrap writes these launchers:
 
-  #IECSO
-  /data/storage/el1/bundle/libs/arm64/libgit.so
-  iec_git_main
-  2
+  git               -> libgit.so:iec_git_main
+  git-remote-http   -> libgit-remote-http.so:iec_git_remote_http_main
+  git-remote-https  -> libgit-remote-http.so:iec_git_remote_http_main
 
-Only the git binary is in the object; remote helpers, templates and the CA
-bundle still have to be provided separately.
+The template directory and GIT_SSL_CAINFO are initialized by the same bootstrap;
+the CA file itself is written from the copy embedded in libiec_server.so.
 EOF
