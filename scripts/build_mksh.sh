@@ -80,7 +80,8 @@ WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat
        close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r
        tcgetattr tcsetattr tcgetpgrp tcsetpgrp getpt grantpt unlockpt ptsname
        openpty login_tty forkpty
-       execve execv execvp execvpe execl execlp execle)
+       execve execv execvp execvpe execl execlp execle
+       exit)
 WRAP_FLAGS=()
 for name in "${WRAPS[@]}"; do
 	WRAP_FLAGS+=("-Wl,--wrap=$name")
@@ -109,6 +110,7 @@ $CC "${SHIM_CFLAGS[@]}" -DIEC_SHIM_MERGED_OPEN -c "$ROOT/fs/shim.c" -o "$BUILD/i
 $CC "${SHIM_CFLAGS[@]}" -c "$ROOT/exec/shim.c" -o "$BUILD/iec_exec_shim.o"
 $CC "${SHIM_CFLAGS[@]}" -c "$ROOT/common/rpc.c" -o "$BUILD/iec_rpc.o"
 $CC "${SHIM_CFLAGS[@]}" -c "$ROOT/common/sock_client.c" -o "$BUILD/iec_sock_client.o"
+$CC -O2 -fPIC -c "$ROOT/compat/exit_wrap.c" -o "$BUILD/exit_wrap.o"
 
 echo "==> link $OUT" >&2
 $CC -shared -o "$OUT" "$BUILD"/*.o \

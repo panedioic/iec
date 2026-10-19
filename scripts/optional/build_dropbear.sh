@@ -121,6 +121,7 @@ $CC "${SHIM_CFLAGS[@]}" -c "$IEC_ROOT/common/rpc.c" -o "$BUILD/iec_rpc.o"
 $CC "${SHIM_CFLAGS[@]}" -c "$IEC_ROOT/common/sock_client.c" -o "$BUILD/iec_sock_client.o"
 $CC "${SHIM_CFLAGS[@]}" -c "$IEC_ROOT/misc/getpass.c" -o "$BUILD/iec_getpass.o"
 $CC "${SHIM_CFLAGS[@]}" -c "$IEC_ROOT/misc/account.c" -o "$BUILD/iec_account.o"
+$CC "${SHIM_CFLAGS[@]}" -c "$IEC_ROOT/compat/exit_wrap.c" -o "$BUILD/exit_wrap.o"
 
 log "make (MULTI=1)"
 make -j"$JOBS" MULTI=1 \
@@ -140,7 +141,8 @@ WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat
        close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r
        tcgetattr tcsetattr tcgetpgrp tcsetpgrp getpt grantpt unlockpt ptsname
        openpty login_tty forkpty
-       execve execv execvp execvpe execl execlp execle)
+       execve execv execvp execvpe execl execlp execle
+       exit)
 WRAP_FLAGS=()
 for name in "${WRAPS[@]}"; do
 	WRAP_FLAGS+=("-Wl,--wrap=$name")
@@ -152,7 +154,7 @@ $CC -shared -o "$OUT" \
 	"$BUILD"/obj/*.o \
 	"$BUILD"/iec_tty_shim.o "$BUILD"/iec_fs_shim.o \
 	"$BUILD"/iec_exec_shim.o "$BUILD"/iec_rpc.o "$BUILD"/iec_sock_client.o \
-	"$BUILD"/iec_getpass.o "$BUILD"/iec_account.o \
+	"$BUILD"/iec_getpass.o "$BUILD"/iec_account.o "$BUILD"/exit_wrap.o \
 	"$BUILD"/libtomcrypt/libtomcrypt.a "$BUILD"/libtommath/libtommath.a \
 	-Wl,-soname,libdropbear.so \
 	"${WRAP_FLAGS[@]}" \
