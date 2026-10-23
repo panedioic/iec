@@ -68,5 +68,5 @@ target_compile_definitions(iec_har PRIVATE _GNU_SOURCE)
 set_target_properties(iec_har PROPERTIES OUTPUT_NAME iec_server)
 
 target_link_libraries(iec_har PUBLIC
-    libace_napi.z.so libhilog_ndk.z.so
+    libace_napi.z.so libhilog_ndk.z.so librawfile.z.so
     iec_caps dl pthread)

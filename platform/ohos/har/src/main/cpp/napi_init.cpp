@@ -6,11 +6,22 @@
 #include <napi/native_api.h>
 #include <sys/stat.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <dlfcn.h>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "rawfile/raw_file.h"
+#include "rawfile/raw_file_manager.h"
 
 /* OH_LOG_INFO uses these two when it is expanded; without them the default
  * domain is 0 and the tag is NULL, which is not a useful hilog record. */
@@ -123,6 +134,10 @@ std::mutex g_server_lock;
 std::unique_ptr<TtyServer> g_tty_server;
 std::unique_ptr<ExecServer> g_exec_server;
 
+// Resource manager registered by ArkTS. It is the same application-level
+// manager BetterSH uses for libentry.so; HAR rawfiles are merged into it.
+NativeResourceManager* g_res_mgr = nullptr;
+
 // Caller holds g_server_lock. Each pointer is null unless every step that
 // produced it succeeded, so this is also the rollback for a partly started pair.
 void StopServersLocked() {
@@ -145,7 +160,377 @@ void EnsureParentDir(const std::string& path) {
     mkdir(path.substr(0, slash).c_str(), 0755);
 }
 
-// startIecServer(ttyPath?: string, execPath?: string): boolean
+// ── libarchive, loaded on demand ───────────────────────────────────────────
+//
+// Linking libarchive into the HAR makes Hvigor's ProcessLibs treat it as a
+// build product. Loading the shared object at runtime keeps the CMake target
+// independent of the media build: build_libarchive.sh puts a shimmed
+// libarchive.so.13 in the HAR libs, and unpackResource() only needs its public
+// entry points.
+struct Archive;
+struct ArchiveEntry;
+
+constexpr int kArchiveOk = 0;
+constexpr int kArchiveEof = 1;
+constexpr int kArchiveWarn = -20;
+constexpr int kExtractPerm = 0x0002;
+constexpr int kExtractTime = 0x0004;
+constexpr int kExtractSecureNoDotDot = 0x0200;
+
+struct ArchiveApi {
+    void* handle = nullptr;
+
+    Archive* (*read_new)() = nullptr;
+    int (*read_support_filter_all)(Archive*) = nullptr;
+    int (*read_support_format_all)(Archive*) = nullptr;
+    int (*read_open_memory)(Archive*, const void*, size_t) = nullptr;
+    int (*read_next_header)(Archive*, ArchiveEntry**) = nullptr;
+    ssize_t (*read_data)(Archive*, void*, size_t) = nullptr;
+    int (*read_free)(Archive*) = nullptr;
+
+    Archive* (*write_disk_new)() = nullptr;
+    int (*write_disk_set_options)(Archive*, int) = nullptr;
+    int (*write_header)(Archive*, ArchiveEntry*) = nullptr;
+    ssize_t (*write_data)(Archive*, const void*, size_t) = nullptr;
+    int (*write_finish_entry)(Archive*) = nullptr;
+    int (*write_free)(Archive*) = nullptr;
+
+    const char* (*error_string)(Archive*) = nullptr;
+    const char* (*entry_pathname)(ArchiveEntry*) = nullptr;
+    void (*entry_set_pathname)(ArchiveEntry*, const char*) = nullptr;
+    const char* (*entry_hardlink)(ArchiveEntry*) = nullptr;
+    void (*entry_set_hardlink)(ArchiveEntry*, const char*) = nullptr;
+    int64_t (*entry_size)(ArchiveEntry*) = nullptr;
+};
+
+template <typename T>
+bool LoadSym(void* handle, const char* name, T* out)
+{
+    *out = reinterpret_cast<T>(dlsym(handle, name));
+    return *out != nullptr;
+}
+
+const ArchiveApi& GetArchiveApi()
+{
+    static ArchiveApi api;
+    static std::once_flag once;
+
+    std::call_once(once, [] {
+        static const char* const candidates[] = {
+            "libarchive.so.13",
+            "libarchive.so",
+            "/data/storage/el1/bundle/libs/arm64/libarchive.so.13",
+            "/data/storage/el1/bundle/libs/arm64/libarchive.so",
+        };
+        for (const char* name : candidates) {
+            api.handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+            if (api.handle) break;
+        }
+        if (!api.handle) {
+            Logger::GetInstance()->LogE("[iec] cannot dlopen libarchive: %s",
+                                        dlerror());
+            return;
+        }
+
+        bool ok = true;
+        ok &= LoadSym(api.handle, "archive_read_new", &api.read_new);
+        ok &= LoadSym(api.handle, "archive_read_support_filter_all",
+                      &api.read_support_filter_all);
+        ok &= LoadSym(api.handle, "archive_read_support_format_all",
+                      &api.read_support_format_all);
+        ok &= LoadSym(api.handle, "archive_read_open_memory",
+                      &api.read_open_memory);
+        ok &= LoadSym(api.handle, "archive_read_next_header",
+                      &api.read_next_header);
+        ok &= LoadSym(api.handle, "archive_read_data", &api.read_data);
+        ok &= LoadSym(api.handle, "archive_read_free", &api.read_free);
+        ok &= LoadSym(api.handle, "archive_write_disk_new",
+                      &api.write_disk_new);
+        ok &= LoadSym(api.handle, "archive_write_disk_set_options",
+                      &api.write_disk_set_options);
+        ok &= LoadSym(api.handle, "archive_write_header", &api.write_header);
+        ok &= LoadSym(api.handle, "archive_write_data", &api.write_data);
+        ok &= LoadSym(api.handle, "archive_write_finish_entry",
+                      &api.write_finish_entry);
+        ok &= LoadSym(api.handle, "archive_write_free", &api.write_free);
+        ok &= LoadSym(api.handle, "archive_error_string", &api.error_string);
+        ok &= LoadSym(api.handle, "archive_entry_pathname",
+                      &api.entry_pathname);
+        ok &= LoadSym(api.handle, "archive_entry_set_pathname",
+                      &api.entry_set_pathname);
+        ok &= LoadSym(api.handle, "archive_entry_hardlink",
+                      &api.entry_hardlink);
+        ok &= LoadSym(api.handle, "archive_entry_set_hardlink",
+                      &api.entry_set_hardlink);
+        ok &= LoadSym(api.handle, "archive_entry_size", &api.entry_size);
+
+        if (!ok) {
+            Logger::GetInstance()->LogE(
+                "[iec] libarchive is missing one or more entry points");
+            dlclose(api.handle);
+            api = ArchiveApi();
+        }
+    });
+
+    return api;
+}
+
+// ── bootstrap helpers ──────────────────────────────────────────────────────
+
+// Reads a required string argument. Returns false after throwing.
+bool ReadStringArg(napi_env env, napi_value value, const char* what,
+                   std::string& out) {
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, value, &type) != napi_ok || type != napi_string) {
+        napi_throw_type_error(env, nullptr, what);
+        return false;
+    }
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, value, nullptr, 0, &len) != napi_ok)
+        return false;
+    std::vector<char> buf(len + 1, '\0');
+    if (napi_get_value_string_utf8(env, value, buf.data(), buf.size(), &len) !=
+        napi_ok)
+        return false;
+    out.assign(buf.data(), len);
+    return true;
+}
+
+napi_value IntResult(napi_env env, int value) {
+    napi_value ret = nullptr;
+    napi_create_int32(env, value, &ret);
+    return ret;
+}
+
+napi_value BoolResult(napi_env env, bool value) {
+    napi_value ret = nullptr;
+    napi_get_boolean(env, value, &ret);
+    return ret;
+}
+
+// mkdir -p. Existing levels are not an error.
+bool EnsureDirs(const std::string& path) {
+    if (path.empty()) return true;
+
+    std::string current;
+    size_t start = 0;
+    if (path[0] == '/') {
+        current = "/";
+        start = 1;
+    }
+
+    while (start <= path.size()) {
+        const size_t slash = path.find('/', start);
+        const std::string part =
+            path.substr(start, slash == std::string::npos ? std::string::npos
+                                                           : slash - start);
+        if (!part.empty()) {
+            if (!current.empty() && current.back() != '/') current += '/';
+            current += part;
+            if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
+                Logger::GetInstance()->LogE("[iec] mkdir %s: %s",
+                                            current.c_str(), strerror(errno));
+                return false;
+            }
+        }
+        if (slash == std::string::npos) break;
+        start = slash + 1;
+    }
+    return true;
+}
+
+bool WriteAll(int fd, const void* data, size_t size) {
+    const char* p = static_cast<const char*>(data);
+    size_t left = size;
+    while (left > 0) {
+        const ssize_t n = write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        p += n;
+        left -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+std::string ParentOf(const std::string& path) {
+    const size_t slash = path.rfind('/');
+    if (slash == std::string::npos) return std::string();
+    if (slash == 0) return "/";
+    return path.substr(0, slash);
+}
+
+bool WriteFile(const std::string& path, const void* data, size_t size,
+               mode_t mode) {
+    if (!EnsureDirs(ParentOf(path))) return false;
+
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) return false;
+    bool ok = WriteAll(fd, data, size);
+    if (close(fd) != 0) ok = false;
+    return ok;
+}
+
+// A member name may not escape the destination directory.
+bool SafeJoin(const std::string& dest, const char* name, std::string* out) {
+    if (!name || !*name) return false;
+
+    std::string rel(name);
+    while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
+    if (rel.empty()) return false;
+
+    for (size_t pos = 0; (pos = rel.find("..", pos)) != std::string::npos;) {
+        const bool left = pos == 0 || rel[pos - 1] == '/';
+        const bool right = pos + 2 == rel.size() || rel[pos + 2] == '/';
+        if (left && right) return false;
+        pos += 2;
+    }
+
+    *out = dest + "/" + rel;
+    return true;
+}
+
+// Extracts an archive through libarchive's write-disk path.
+bool ExtractTar(const unsigned char* data, size_t size,
+                const std::string& dest) {
+    const ArchiveApi& api = GetArchiveApi();
+    if (!api.handle) return false;
+
+    Archive* a = api.read_new();
+    Archive* ext = api.write_disk_new();
+    if (!a || !ext) {
+        if (a) api.read_free(a);
+        if (ext) api.write_free(ext);
+        return false;
+    }
+
+    api.read_support_filter_all(a);
+    api.read_support_format_all(a);
+    api.write_disk_set_options(
+        ext, kExtractTime | kExtractPerm | kExtractSecureNoDotDot);
+
+    if (api.read_open_memory(a, data, size) != kArchiveOk) {
+        const char* err = api.error_string(a);
+        Logger::GetInstance()->LogE("[iec] archive open: %s",
+                                    err ? err : "(unknown)");
+        api.read_free(a);
+        api.write_free(ext);
+        return false;
+    }
+
+    bool ok = true;
+    ArchiveEntry* entry = nullptr;
+    for (;;) {
+        int r = api.read_next_header(a, &entry);
+        if (r == kArchiveEof) break;
+        if (r < kArchiveOk) {
+            const char* err = api.error_string(a);
+            Logger::GetInstance()->LogE("[iec] archive header: %s",
+                                        err ? err : "(unknown)");
+            ok = false;
+            break;
+        }
+
+        const char* name = api.entry_pathname(entry);
+        std::string path;
+        if (!SafeJoin(dest, name, &path)) {
+            Logger::GetInstance()->LogE("[iec] archive: unsafe path %s",
+                                        name ? name : "(null)");
+            ok = false;
+            break;
+        }
+        api.entry_set_pathname(entry, path.c_str());
+
+        const char* hardlink = api.entry_hardlink(entry);
+        if (hardlink) {
+            std::string target;
+            if (SafeJoin(dest, hardlink, &target))
+                api.entry_set_hardlink(entry, target.c_str());
+        }
+
+        // libarchive's write-disk path calls symlink(); the shared object is
+        // linked with fs/shim.c, so a link becomes a <name>.IEC_SYMLINK marker
+        // without any special case here.
+        r = api.write_header(ext, entry);
+        if (r == kArchiveWarn) {
+            const char* err = api.error_string(ext);
+            Logger::GetInstance()->LogW("[iec] archive header warn: %s",
+                                        err ? err : "(unknown)");
+        } else if (r < kArchiveWarn) {
+            const char* err = api.error_string(ext);
+            Logger::GetInstance()->LogE("[iec] archive write header: %s",
+                                        err ? err : "(unknown)");
+            ok = false;
+            break;
+        }
+
+        if (api.entry_size(entry) > 0) {
+            char buf[64 * 1024];
+            ssize_t n;
+            while ((n = api.read_data(a, buf, sizeof buf)) > 0) {
+                if (api.write_data(ext, buf, static_cast<size_t>(n)) < 0) {
+                    const char* err = api.error_string(ext);
+                    Logger::GetInstance()->LogE("[iec] archive write data: %s",
+                                                err ? err : "(unknown)");
+                    ok = false;
+                    break;
+                }
+            }
+            if (n < 0) {
+                const char* err = api.error_string(a);
+                Logger::GetInstance()->LogE("[iec] archive read data: %s",
+                                            err ? err : "(unknown)");
+                ok = false;
+            }
+            if (!ok) break;
+        }
+
+        r = api.write_finish_entry(ext);
+        if (r == kArchiveWarn) {
+            const char* err = api.error_string(ext);
+            Logger::GetInstance()->LogW("[iec] archive finish warn: %s",
+                                        err ? err : "(unknown)");
+        } else if (r < kArchiveWarn) {
+            const char* err = api.error_string(ext);
+            Logger::GetInstance()->LogE("[iec] archive finish: %s",
+                                        err ? err : "(unknown)");
+            ok = false;
+            break;
+        }
+    }
+
+    api.read_free(a);
+    api.write_free(ext);
+    return ok;
+}
+
+bool ReadRawFile(NativeResourceManager* mgr, const std::string& name,
+                 std::vector<unsigned char>* out) {
+    if (!mgr || !out) return false;
+
+    RawFile* rf = OH_ResourceManager_OpenRawFile(mgr, name.c_str());
+    if (!rf) return false;
+
+    const long size = OH_ResourceManager_GetRawFileSize(rf);
+    if (size <= 0 || size > (256L * 1024 * 1024)) {
+        OH_ResourceManager_CloseRawFile(rf);
+        return false;
+    }
+
+    out->resize(static_cast<size_t>(size));
+    size_t off = 0;
+    while (off < out->size()) {
+        const int n = OH_ResourceManager_ReadRawFile(
+            rf, out->data() + off, out->size() - off);
+        if (n <= 0) break;
+        off += static_cast<size_t>(n);
+    }
+    OH_ResourceManager_CloseRawFile(rf);
+    return off == out->size();
+}
+
+
 napi_value StartServer(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value argv[2] = {nullptr, nullptr};
@@ -241,6 +626,167 @@ napi_value InstallCaBundle(napi_env env, napi_callback_info info) {
     return ret;
 }
 
+napi_value InitIecResourceManager(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr,
+                              "initIecResourceManager(resourceManager) expects one argument");
+        return nullptr;
+    }
+
+    if (g_res_mgr) {
+        OH_ResourceManager_ReleaseNativeResourceManager(g_res_mgr);
+        g_res_mgr = nullptr;
+    }
+    g_res_mgr = OH_ResourceManager_InitNativeResourceManager(env, argv[0]);
+    if (!g_res_mgr) {
+        Logger::GetInstance()->LogE("[iec] cannot initialize the resource manager");
+    }
+    return BoolResult(env, g_res_mgr != nullptr);
+}
+
+constexpr const char* kRawfileVersionMarker = FAKE_SYSROOT "/.rawfile-version";
+
+napi_value CheckRawfileVersionMarker(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string expected;
+    if (argc < 1 ||
+        !ReadStringArg(env, argv[0],
+                       "checkRawfileVersionMarker(version) expects a string",
+                       expected))
+        return nullptr;
+
+    const int fd = open(kRawfileVersionMarker, O_RDONLY);
+    if (fd < 0) return BoolResult(env, false);
+
+    char buf[128];
+    const ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return BoolResult(env, false);
+
+    std::string got(buf, static_cast<size_t>(n));
+    while (!got.empty() &&
+           (got.back() == '\n' || got.back() == '\r' ||
+            got.back() == ' ' || got.back() == '\t'))
+        got.pop_back();
+
+    return BoolResult(env, got == expected);
+}
+
+napi_value WriteRawfileVersionMarker(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string version;
+    if (argc < 1 ||
+        !ReadStringArg(env, argv[0],
+                       "writeRawfileVersionMarker(version) expects a string",
+                       version))
+        return nullptr;
+
+    const bool ok = WriteFile(kRawfileVersionMarker, version.data(),
+                              version.size(), 0644);
+    return IntResult(env, ok ? 0 : 1);
+}
+
+napi_value EnsureDir(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string path;
+    if (argc < 1 ||
+        !ReadStringArg(env, argv[0], "ensureDir(path) expects a string", path))
+        return nullptr;
+
+    return IntResult(env, EnsureDirs(path) ? 0 : 1);
+}
+
+napi_value WriteSoLauncher(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string target, so, entry;
+    int32_t arity = 0;
+    if (argc < 4 ||
+        !ReadStringArg(env, argv[0],
+                       "writeSoLauncher(target, so, entry, arity)", target) ||
+        !ReadStringArg(env, argv[1],
+                       "writeSoLauncher(target, so, entry, arity)", so) ||
+        !ReadStringArg(env, argv[2],
+                       "writeSoLauncher(target, so, entry, arity)", entry))
+        return nullptr;
+    if (napi_get_value_int32(env, argv[3], &arity) != napi_ok) {
+        napi_throw_type_error(env, nullptr,
+                              "writeSoLauncher: arity must be 2 or 3");
+        return nullptr;
+    }
+
+    if (target.empty() || so.empty() || so[0] != '/' || entry.empty() ||
+        entry.size() > 255 || (arity != 2 && arity != 3) ||
+        so.find('\n') != std::string::npos ||
+        entry.find('\n') != std::string::npos) {
+        Logger::GetInstance()->LogE("[iec] invalid launcher: %s", target.c_str());
+        return IntResult(env, 1);
+    }
+
+    const std::string body = "#IECSO\n" + so + "\n" + entry + "\n" +
+                             std::to_string(arity) + "\n";
+    if (!WriteFile(target, body.data(), body.size(), 0755) ||
+        chmod(target.c_str(), 0755) != 0) {
+        Logger::GetInstance()->LogE("[iec] cannot write launcher: %s",
+                                    target.c_str());
+        return IntResult(env, 1);
+    }
+    return IntResult(env, 0);
+}
+
+napi_value UnpackResource(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string name, dest;
+    if (argc < 2 ||
+        !ReadStringArg(env, argv[0],
+                       "unpackResource(name, dest) expects two strings", name) ||
+        !ReadStringArg(env, argv[1],
+                       "unpackResource(name, dest) expects two strings", dest))
+        return nullptr;
+
+    if (!g_res_mgr) {
+        Logger::GetInstance()->LogE("[iec] unpack %s: resource manager is not set",
+                                    name.c_str());
+        return IntResult(env, 1);
+    }
+
+    std::vector<unsigned char> data;
+    if (!ReadRawFile(g_res_mgr, name, &data)) {
+        Logger::GetInstance()->LogE("[iec] unpack %s: rawfile read failed",
+                                    name.c_str());
+        return IntResult(env, 1);
+    }
+    if (!EnsureDirs(dest)) return IntResult(env, 1);
+
+    if (!ExtractTar(data.data(), data.size(), dest)) {
+        Logger::GetInstance()->LogE("[iec] unpack %s -> %s failed",
+                                    name.c_str(), dest.c_str());
+        return IntResult(env, 1);
+    }
+
+    Logger::GetInstance()->LogI("[iec] unpacked %s -> %s (%zu bytes)",
+                                name.c_str(), dest.c_str(), data.size());
+    return IntResult(env, 0);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     // The logger has no OHOS dependency of its own. Register hilog as a custom
     // sink here, where the NAPI/hilog libraries are already linked.
@@ -262,12 +808,18 @@ napi_value Init(napi_env env, napi_value exports) {
     }
 
     napi_property_descriptor desc[] = {
-        {"hello", nullptr, Hello, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"setCaps", nullptr, SetCaps, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"probeCaps", nullptr, ProbeCaps, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"startIecServer", nullptr, StartServer, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"stopIecServer", nullptr, StopServer, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"installCaBundle", nullptr, InstallCaBundle, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"hello",                       nullptr, Hello,                     nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setCaps",                     nullptr, SetCaps,                   nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"probeCaps",                   nullptr, ProbeCaps,                 nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"startIecServer",              nullptr, StartServer,               nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"stopIecServer",               nullptr, StopServer,                nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"installCaBundle",             nullptr, InstallCaBundle,           nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"initIecResourceManager",      nullptr, InitIecResourceManager,    nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"checkRawfileVersionMarker",   nullptr, CheckRawfileVersionMarker, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"writeRawfileVersionMarker",   nullptr, WriteRawfileVersionMarker, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"ensureDir",                   nullptr, EnsureDir,                 nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"writeSoLauncher",             nullptr, WriteSoLauncher,           nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"unpackResource",              nullptr, UnpackResource,            nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;
