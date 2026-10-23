@@ -52,11 +52,19 @@ vgcore.*
 /thirdparty/dropbear/
 /thirdparty/pcre2/
 /thirdparty/zlib-*/
+/thirdparty/libarchive-*/
 /thirdparty/openssl-*/
 /thirdparty/curl-*/
+/thirdparty/node-*/
+/thirdparty/ncurses/
+/thirdparty/libffi/
+/thirdparty/Python-*/
 /thirdparty/*.tar.gz
 /thirdparty/*.tar.xz
 /thirdparty/*.tar.bz2
+
+# ---- Generated runtime resources ----
+/platform/ohos/har/src/main/resources/rawfile/tools/*.tar
 
 # ---- Local environment ----
 /scripts/env.sh
