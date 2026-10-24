@@ -295,6 +295,23 @@ static int pts_tcsetpgrp(int pts_n, pid_t pgrp) {
     return rpc_call(OP_TCSETPGRP, req, sizeof req, NULL, 0, NULL);
 }
 
+/* A program that starts with one of our terminals on stdin is the terminal's
+ * foreground program: its shell has just started it, in the foreground. The
+ * server owns that number and is the only process that can act on it, so it has
+ * to be told -- an interactive shell (mksh) waits for tcgetpgrp(0) to name its
+ * own group before it reads a line, and if its group is behind a stand-in pid it
+ * spins on that question forever. That is what a shell started from a shell used
+ * to do. Nothing else in this process says so, and this runs before main(). */
+__attribute__((constructor))
+static void shim_claim_foreground(void) {
+    int n;
+
+    if (fcntl(STDIN_FILENO, F_GETFD) < 0) return;
+    n = identify(STDIN_FILENO);
+    if (n < 0) return;
+    pts_tcsetpgrp(n, getpgrp());
+}
+
 static int pts_getwinsz(int pts_n, struct winsize *ws) {
     uint8_t req[4];
     req_pts(req, pts_n);
