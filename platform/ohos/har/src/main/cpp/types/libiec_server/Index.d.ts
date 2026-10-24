@@ -37,10 +37,17 @@ export const writeRawfileVersionMarker: (version: string) => number;
 // mkdir -p. 0 on success, 1 on failure.
 export const ensureDir: (path: string) => number;
 
-// Writes an #IECSO launcher file at `target`. 0 on success, 1 on failure.
+// Writes an #IECSOv2 launcher file at `target`. 0 on success, 1 on failure.
+// `primary` is the process relationship the launcher asks for: 0 = the server
+// decides (also what an absent line means), 1 = fork, 2 = HarmonyOS native child
+// process, 3 = in this process.
 export const writeSoLauncher: (target: string, so: string, entry: string,
-                               arity: number) => number;
+                               arity: number, primary?: number) => number;
 
 // Extracts a tar stored in rawfile `name` into `dest`. 0 on success, 1 on
 // failure. Symlinks become <name>.IEC_SYMLINK marker files.
 export const unpackResource: (name: string, dest: string) => number;
+
+// Writes `data` to `target` (parent directories must exist). 0 on success, 1 on
+// failure.
+export const writeTxtFile: (target: string, data: string) => number;

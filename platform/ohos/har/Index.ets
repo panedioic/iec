@@ -12,7 +12,8 @@ import {
   writeRawfileVersionMarker,
   ensureDir,
   writeSoLauncher,
-  unpackResource
+  unpackResource,
+  writeTxtFile
 } from 'libiec_server.so';
 
 export {
@@ -27,5 +28,6 @@ export {
   writeRawfileVersionMarker,
   ensureDir,
   writeSoLauncher,
-  unpackResource
+  unpackResource,
+  writeTxtFile
 };

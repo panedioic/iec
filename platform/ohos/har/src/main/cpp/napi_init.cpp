@@ -710,24 +710,40 @@ napi_value EnsureDir(napi_env env, napi_callback_info info) {
 }
 
 napi_value WriteSoLauncher(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
 
     std::string target, so, entry;
     int32_t arity = 0;
     if (argc < 4 ||
         !ReadStringArg(env, argv[0],
-                       "writeSoLauncher(target, so, entry, arity)", target) ||
+                       "writeSoLauncher(target, so, entry, arity, primary)", target) ||
         !ReadStringArg(env, argv[1],
-                       "writeSoLauncher(target, so, entry, arity)", so) ||
+                       "writeSoLauncher(target, so, entry, arity, primary)", so) ||
         !ReadStringArg(env, argv[2],
-                       "writeSoLauncher(target, so, entry, arity)", entry))
+                       "writeSoLauncher(target, so, entry, arity, primary)", entry))
         return nullptr;
     if (napi_get_value_int32(env, argv[3], &arity) != napi_ok) {
         napi_throw_type_error(env, nullptr,
                               "writeSoLauncher: arity must be 2 or 3");
         return nullptr;
+    }
+
+    // The fifth argument names the process relationship: 0 = let the server decide,
+    // 1 = fork, 2 = native child process, 3 = in this process. Optional, and 0 is
+    // what an absent line means.
+    int32_t primary = 0;
+    if (argc >= 5) {
+        napi_value converted = nullptr;
+        if (napi_coerce_to_number(env, argv[4], &converted) == napi_ok) {
+            napi_get_value_int32(env, converted, &primary);
+        }
+        if (primary < 0 || primary > 3) {
+            napi_throw_type_error(env, nullptr,
+                                  "writeSoLauncher: primary must be 0, 1, 2 or 3");
+            return nullptr;
+        }
     }
 
     if (target.empty() || so.empty() || so[0] != '/' || entry.empty() ||
@@ -738,8 +754,9 @@ napi_value WriteSoLauncher(napi_env env, napi_callback_info info) {
         return IntResult(env, 1);
     }
 
-    const std::string body = "#IECSO\n" + so + "\n" + entry + "\n" +
-                             std::to_string(arity) + "\n";
+    std::string body = "#IECSOv2\n" + so + "\n" + entry + "\n" +
+                       std::to_string(arity) + "\n";
+    if (primary != 0) body += std::to_string(primary) + "\n";
     if (!WriteFile(target, body.data(), body.size(), 0755) ||
         chmod(target.c_str(), 0755) != 0) {
         Logger::GetInstance()->LogE("[iec] cannot write launcher: %s",
@@ -787,6 +804,27 @@ napi_value UnpackResource(napi_env env, napi_callback_info info) {
     return IntResult(env, 0);
 }
 
+napi_value WriteTxtFile(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string target, data;
+    if (!ReadStringArg(env, argv[0],
+                       "writeTxtFile(target, data)", target) ||
+        !ReadStringArg(env, argv[1],
+                       "writeTxtFile(target, data)", data))
+        return nullptr;
+
+    if (!WriteFile(target, data.data(), data.size(), 0755) ||
+        chmod(target.c_str(), 0755) != 0) {
+        Logger::GetInstance()->LogE("[iec] cannot write file: %s",
+                                    target.c_str());
+        return IntResult(env, 1);
+    }
+    return IntResult(env, 0);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     // The logger has no OHOS dependency of its own. Register hilog as a custom
     // sink here, where the NAPI/hilog libraries are already linked.
@@ -820,6 +858,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"ensureDir",                   nullptr, EnsureDir,                 nullptr, nullptr, nullptr, napi_default, nullptr},
         {"writeSoLauncher",             nullptr, WriteSoLauncher,           nullptr, nullptr, nullptr, napi_default, nullptr},
         {"unpackResource",              nullptr, UnpackResource,            nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"writeTxtFile",                nullptr, WriteTxtFile,              nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;
