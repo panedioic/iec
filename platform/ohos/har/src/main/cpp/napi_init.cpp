@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <exception>
@@ -825,6 +826,41 @@ napi_value WriteTxtFile(napi_env env, napi_callback_info info) {
     return IntResult(env, 0);
 }
 
+napi_value CopyRawFile(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string raw, dst;
+    if (argc < 2 ||
+        !ReadStringArg(env, argv[0],
+                       "CopyRawFile(rawName, dstPath)", raw) ||
+        !ReadStringArg(env, argv[1],
+                       "CopyRawFile(rawName, dstPath)", dst))
+        return nullptr;
+
+    if (!g_res_mgr) {
+        Logger::GetInstance()->LogE("[iec] copyRawFile %s: resource manager is not set",
+                                    raw.c_str());
+        return IntResult(env, 1);
+    }
+
+    std::vector<unsigned char> data;
+    if (!ReadRawFile(g_res_mgr, raw, &data)) {
+        Logger::GetInstance()->LogE("[iec] copyRawFile %s: rawfile read failed",
+                                    raw.c_str());
+        return IntResult(env, 2);
+    }
+    if (!WriteFile(dst, data.data(), data.size(), 0644)) {
+        Logger::GetInstance()->LogE("[iec] copyRawFile %s -> %s: write failed",
+                                    raw.c_str(), dst.c_str());
+        return IntResult(env, 3);
+    }
+    Logger::GetInstance()->LogI("[iec] copyRawFile %s -> %s (%zu bytes)",
+                                raw.c_str(), dst.c_str(), data.size());
+    return IntResult(env, 0);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     // The logger has no OHOS dependency of its own. Register hilog as a custom
     // sink here, where the NAPI/hilog libraries are already linked.
@@ -859,6 +895,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"writeSoLauncher",             nullptr, WriteSoLauncher,           nullptr, nullptr, nullptr, napi_default, nullptr},
         {"unpackResource",              nullptr, UnpackResource,            nullptr, nullptr, nullptr, napi_default, nullptr},
         {"writeTxtFile",                nullptr, WriteTxtFile,              nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"copyRawFile",                 nullptr, CopyRawFile,               nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;

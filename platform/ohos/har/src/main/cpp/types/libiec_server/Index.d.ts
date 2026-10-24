@@ -51,3 +51,8 @@ export const unpackResource: (name: string, dest: string) => number;
 // Writes `data` to `target` (parent directories must exist). 0 on success, 1 on
 // failure.
 export const writeTxtFile: (target: string, data: string) => number;
+
+// Copies one rawfile (`rawName`, relative to the rawfile root) to `dst` on disk.
+// The caller decides where each file belongs.
+//   0 success, 1 no resource manager, 2 rawfile missing/empty, 3 write failed.
+export const copyRawFile: (rawName: string, dstPath: string) => number;

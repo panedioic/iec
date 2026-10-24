@@ -13,7 +13,8 @@ import {
   ensureDir,
   writeSoLauncher,
   unpackResource,
-  writeTxtFile
+  writeTxtFile,
+  copyRawFile
 } from 'libiec_server.so';
 
 export {
@@ -29,5 +30,6 @@ export {
   ensureDir,
   writeSoLauncher,
   unpackResource,
-  writeTxtFile
+  writeTxtFile,
+  copyRawFile
 };
