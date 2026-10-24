@@ -44,6 +44,7 @@ add_library(iec_har SHARED
     "${IEC_CA_HEADER}"
     "${IEC_ROOT}/tty/tty_server.cpp"
     "${IEC_ROOT}/exec/exec_server.cpp"
+    "${IEC_ROOT}/exec/exec_ncp.cpp"
     "${IEC_ROOT}/exec/path_resolver.cpp"
     "${IEC_ROOT}/exec/exec_loader.cpp"
     "${IEC_ROOT}/exec/exec_so.cpp"
@@ -70,3 +71,15 @@ set_target_properties(iec_har PROPERTIES OUTPUT_NAME iec_server)
 target_link_libraries(iec_har PUBLIC
     libace_napi.z.so libhilog_ndk.z.so librawfile.z.so
     iec_caps dl pthread)
+
+add_library(ncploader SHARED
+    ncploader/main.cpp
+)
+
+# The entry the platform calls in a native child process. It lives in a library of
+# its own so the child loads nothing else: the point of the route is a process with
+# no earlier copy of the object in its symbol scope.
+target_include_directories(ncploader PRIVATE "${IEC_ROOT}")
+target_compile_definitions(ncploader PRIVATE _GNU_SOURCE)
+set_target_properties(ncploader PROPERTIES OUTPUT_NAME ncploader)
+target_link_libraries(ncploader PRIVATE dl)

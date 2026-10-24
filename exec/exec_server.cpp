@@ -25,6 +25,7 @@
 #include "constant.h"
 #include "elf.h"
 #include "exec_loader.h"
+#include "exec_ncp.h"
 #include "exec_qemu.h"
 #include "exec_route.h"
 #include "exec_shebang.h"
@@ -44,7 +45,8 @@ struct ProcessInfo {
     pid_t       pid = 0;
     pid_t       parent_pid = 0;
     pid_t       standin_pid = 0;
-    LaunchKind  kind = LaunchKind::kAuto;
+    PrimaryLaunchKind prikind = PrimaryLaunchKind::kAuto;
+    LaunchKind  kind = LaunchKind::kAuto; // todo: seckind
     std::string cmd;
     int64_t     start_time_ms = 0;
     bool        alive = true;
@@ -396,7 +398,65 @@ void ApplyRequestEnvironment(const SpawnRequest& req) {
     }
 }
 
-SpawnResult Spawn(const SpawnRequest& req) {
+static pid_t StartChild(SpawnRequest* req, LaunchKind kind) {
+    // The launcher may name the relationship it needs; 0 leaves the choice here.
+    if (kind == LaunchKind::kSo) {
+        SoLauncher launcher;
+        if (ResolveSoLauncher(req->path, launcher, nullptr)) {
+            req->prikind = launcher.primary;
+        }
+    }
+    const PrimaryLaunchKind requested = req->prikind;
+    
+    if (requested == PrimaryLaunchKind::kNcp ||
+        (requested == PrimaryLaunchKind::kAuto && Caps().ncp == 1)) {
+        req->prikind = PrimaryLaunchKind::kNcp;
+        std::string why;
+        const pid_t pid = SpawnNcp(*req, kind, &why);
+        if (pid > 0) {
+            Logger::GetInstance()->LogI("[exec] started pid %d as a native child process",
+                                        (int)pid);
+            return pid;
+        }
+        Logger::GetInstance()->LogW("[exec] native child process refused: %s", why.c_str());
+        return -1;
+    }
+
+    if (requested == PrimaryLaunchKind::kFork ||
+        (requested == PrimaryLaunchKind::kAuto && Caps().fork == 1)) {
+        req->prikind = PrimaryLaunchKind::kFork;
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            Logger::GetInstance()->LogE("[exec] fork failed: %s", strerror(errno));
+            return -1;
+        }
+        if (pid != 0) return pid;
+
+        ClearInheritedSignalMask();
+        ResetSignalDispositions();
+
+        setpgid(0, 0);
+
+        if (!InstallInheritedFds(*req)) {
+            static const char msg[] = "[exec] inherited fd setup failed\n";
+            if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
+            _exit(kExecFailedExit);
+        }
+        ApplyRequestEnvironment(*req);
+        StartByKind(kind, *req);
+    }
+
+    if (requested == PrimaryLaunchKind::kInProc) {
+        // Running a program in this process is not implemented.
+        return -1;
+    }
+
+    req->prikind = PrimaryLaunchKind::kInProc;
+    return -1;
+}
+
+SpawnResult Spawn(SpawnRequest req) {
     SpawnResult res;
     if (req.path.empty()) { res.error = "path is empty"; return res; }
 
@@ -404,49 +464,12 @@ SpawnResult Spawn(const SpawnRequest& req) {
     // fork so that both sides agree on what is being started.
     res.kind = req.kind_hint == LaunchKind::kAuto ? ResolveKind(req.path) : req.kind_hint;
 
-    pid_t pid = fork();
+    const pid_t pid = StartChild(&req, res.kind);
     if (pid < 0) {
-        Logger::GetInstance()->LogE("[exec] fork failed: %s", strerror(errno));
-        res.pid = -1;
+        res.error = "cannot start " + req.path;
         return res;
-    } else if (pid == 0) {
-        // Child. It must never return into the caller: the caller is the server
-        // itself, so a child that walked back out of here would carry on as a
-        // second server, competing for the same socket and running its own poll
-        // loop. _exit() is the only way out, and it avoids flushing a second copy
-        // of the parent's stdio buffers too.
-        //
-        // Only write(2) from here on. The parent runs one thread per service, so
-        // at the moment of the fork another thread may hold a stdio lock that does
-        // not exist in the child; fprintf would deadlock instead of printing.
-        ClearInheritedSignalMask();
-        ResetSignalDispositions();
-
-        // A process group of its own, never the server's. Anything that arrives by
-        // group -- a terminal's job-control signal, the tty service's kill(-pgrp) for
-        // a pty, a shell stopping itself with kill(0, SIGTTIN) because it decided it
-        // was in the background -- would otherwise reach the server as well, and end
-        // the service and every session on it. The group is the child's own pid, so
-        // the parent can name it without being told. setpgid() is on the list of
-        // calls a child of fork() may make.
-        setpgid(0, 0);
-
-        // The stdio the caller sent comes next: it has to be in place before the
-        // program is entered, and a failure here means the child would run with
-        // the server's own stdin/stdout, which is the very thing fd inheritance
-        // exists to avoid -- so it is reported rather than ignored.
-        if (!InstallInheritedFds(req)) {
-            static const char msg[] = "[exec] inherited fd setup failed\n";
-            if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
-            _exit(kExecFailedExit);
-        }
-        // Constructors in an object started below (tty/shim.c is one) read the
-        // caller's environment, so it has to be in place before StartByKind.
-        ApplyRequestEnvironment(req);
-        // In order to facilitate the reuse of logic in SpawnShebang, the routing 
-        // for the "kind" will be extracted separately as a function here.
-        StartByKind(res.kind, req);
     }
+
     // parent
     ProcessInfo info;
     info.pid = pid;
@@ -456,6 +479,7 @@ SpawnResult Spawn(const SpawnRequest& req) {
     info.parent_pid = ParentPidFor(req);
     info.standin_pid = req.caller_pid;
     info.kind = res.kind;
+    info.prikind = req.prikind;
     info.cmd = req.path;
     info.start_time_ms = NowMillis();
     info.alive = true;
@@ -518,6 +542,16 @@ static void RecordExit(ProcessInfo& info, int status) {
                                          : -1;
 }
 
+// Folds the endings of native child processes into the table. They are not this
+// process's children, so waitpid() never reports them; the platform's callback queues
+// them and this is the only place that touches the table.
+static void DrainNativeExits() {
+    DrainNcpExits([](pid_t pid, int status) {
+        auto it = procmap.find(pid);
+        if (it != procmap.end()) RecordExit(it->second, status);
+    });
+}
+
 // Runs once per pass of the poll loop, whether or not anything arrived, which is
 // what makes it the right place to notice children that exited while the server
 // was idle: a request-driven handler would only run again on the next request,
@@ -547,6 +581,11 @@ static void RecordExit(ProcessInfo& info, int status) {
 // ProcessInfo::standin_pid, which Spawn() fills from SpawnRequest::caller_pid, and
 // the request carries it now. Not implemented.
 void ExecServer::onTick() {
+    // Native child processes are not this process's children, so waitpid() below
+    // never reports them; their endings arrive through the platform's callback and
+    // are folded into the same table here.
+    DrainNativeExits();
+
     // In a loop, because several children can have exited since the previous pass
     // and waitpid() reports them one at a time. WNOHANG so this can never stall
     // the loop on a child that is still running.
@@ -777,6 +816,10 @@ bool ExecServer::onWait(const Packet& req, Reply& reply) {
     }
     pid_t pid = static_cast<pid_t>(get32(req.body.data()));
 
+    // A native child's ending may already have arrived through the platform's
+    // callback; fold those in before asking the kernel about anything.
+    DrainNativeExits();
+
     auto it = procmap.find(pid);
     if (it == procmap.end()) {
         Logger::GetInstance()->LogW(
@@ -799,6 +842,16 @@ bool ExecServer::onWait(const Packet& req, Reply& reply) {
         // and the client goes by the state word alone.
         put32(reply.body, 0);
         put32(reply.body, 0);
+        return true;
+    }
+
+    // A native child is never this process's to collect: waitpid() answers ECHILD
+    // for it from the first call. Until the platform has reported the ending, the
+    // program is still running, which is the same answer a forked child that has not
+    // exited gives.
+    if (it->second.prikind == PrimaryLaunchKind::kNcp) {
+        put32(reply.body, it->second.alive ? 0 : 1);
+        put32(reply.body, it->second.alive ? 0 : static_cast<uint32_t>(it->second.status));
         return true;
     }
 

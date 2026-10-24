@@ -38,6 +38,8 @@
 #  include <sys/prctl.h>
 #endif
 
+#include <dlfcn.h>
+
 #include "logger/logger.h"
 
 // execve() takes the environment as a plain array; the C library owns it.
@@ -56,8 +58,9 @@ constexpr long kJitPrctlOpt = 0x6a6974L;
 
 void LogCaps(const char* source) {
     Logger::GetInstance()->LogI(
-        "[exec] capabilities (%s): chmod=%d fork=%d exec=%d jit=%d path=%d (0x%llx)",
+        "[exec] capabilities (%s): chmod=%d fork=%d exec=%d jit=%d path=%d ncp=%d (0x%llx)",
         source, g_caps.chmod, g_caps.fork, g_caps.exec, g_caps.jit, g_caps.path,
+        g_caps.ncp,
         static_cast<unsigned long long>(PackCaps(g_caps)));
 }
 
@@ -341,6 +344,37 @@ static int ProbeJit() {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* ncp                                                                */
+/* ------------------------------------------------------------------ */
+// ncp: whether the platform can create a native child process. The capability is
+// the library the API lives in plus the entry point itself: a device may ship one
+// without the other, and half of an API is no API.
+static int ProbeNCP() {
+#if defined(__OHOS__)
+    static const int capability = [] {
+        static const char* kCandidates[] = {
+            "libchild_process.so",
+            "/system/lib64/ndk/libchild_process.so",
+            "/system/lib64/platformsdk/libchild_process.so",
+        };
+        void* lib = nullptr;
+        for (const char* candidate : kCandidates) {
+            lib = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
+            if (lib != nullptr) break;
+        }
+        if (lib == nullptr) return 0;
+        const bool ok =
+            dlsym(lib, "OH_Ability_StartNativeChildProcess") != nullptr;
+        dlclose(lib);
+        return ok ? 1 : 0;
+    }();
+    return capability;
+#else
+    return 0;
+#endif
+}
+
 }  // namespace
 
 /* ------------------------------------------------------------------ */
@@ -348,7 +382,8 @@ static int ProbeJit() {
 /* ------------------------------------------------------------------ */
 
 uint64_t PackCaps(const HostCapabilities& caps) {
-    return (static_cast<uint64_t>(caps.chmod & kCapMask) << kCapChmodShift) |
+    return (static_cast<uint64_t>(caps.ncp & kCapMask) << kCapNcpShift) |
+           (static_cast<uint64_t>(caps.chmod & kCapMask) << kCapChmodShift) |
            (static_cast<uint64_t>(caps.fork & kCapMask) << kCapForkShift) |
            (static_cast<uint64_t>(caps.exec & kCapMask) << kCapExecShift) |
            (static_cast<uint64_t>(caps.jit & kCapMask) << kCapJitShift) |
@@ -357,6 +392,7 @@ uint64_t PackCaps(const HostCapabilities& caps) {
 
 HostCapabilities UnpackCaps(uint64_t cap) {
     HostCapabilities caps;
+    caps.ncp   = static_cast<int>((cap >> kCapNcpShift) & kCapMask);
     caps.chmod = static_cast<int>((cap >> kCapChmodShift) & kCapMask);
     caps.fork = static_cast<int>((cap >> kCapForkShift) & kCapMask);
     caps.exec = static_cast<int>((cap >> kCapExecShift) & kCapMask);
@@ -375,6 +411,7 @@ uint64_t ProbeCapabilities() {
     g_caps.path  = ProbePath();
     g_caps.exec  = ProbeExec(g_caps.path, g_caps.fork);
     g_caps.jit   = ProbeJit();
+    g_caps.ncp   = ProbeNCP();
 
     LogCaps("probe");
     return PackCaps(g_caps);

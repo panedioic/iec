@@ -40,8 +40,13 @@ struct HostCapabilities {
      * is reachable, 2 = the disk at large is reachable. This is what decides
      * whether an absolute path has to be rewritten into the fake root. */
     int path = 0;
+
+    /* NCP: 0 = disabled, 1 = enabled. 
+     * Whether to use Native Child Process (in HarmonyOS). */
+    int ncp = 0;
 };
 
+constexpr int kCapNcpShift   = 20;
 constexpr int kCapChmodShift = 16;
 constexpr int kCapForkShift  = 12;
 constexpr int kCapExecShift  = 8;
