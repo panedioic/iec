@@ -11,12 +11,14 @@
 
 #include "exec_types.h"
 
-// What a launcher names: the object to load, the entry point to call in it, and the
-// shape that entry takes (2 for (argc, argv), 3 for (argc, argv, envp)).
+// What a launcher names: the object to load, the entry point to call in it, the
+// shape that entry takes (2 for (argc, argv), 3 for (argc, argv, envp)), and whether
+// the program wants a process of its own instead of a fork of the server.
 struct SoLauncher {
     std::string so;
     std::string entry;
     int arity = 0;
+    PrimaryLaunchKind primary = PrimaryLaunchKind::kAuto;
 };
 
 // Whether a path claims to be a launcher: its first line, and nothing more. A file

@@ -3,12 +3,13 @@
 
 // exec/exec_so.cpp — the launcher for a shared object.
 //
-// A launcher is four lines of text:
+// A launcher is four or five lines of text:
 //
-//   #IECSO
+//   #IECSOv2
 //   /absolute/path/to/libfoo.so
 //   entry_symbol
 //   2                       -- 2 for (argc, argv), 3 for (argc, argv, envp)
+//   0                       -- primary launch kind, 0 for auto
 //
 // It exists for the case where execve is not how programs are started but loading one
 // still is: the file names what to load and where to jump. The reading and parsing
@@ -25,7 +26,7 @@
 #include <cstdio>
 #include <cstring>
 
-#define IEC_SO_MAGIC "#IECSO"
+#define IEC_SO_MAGIC "#IECSOv2"
 
 // The first line of a launcher, on its own. Deliberately not the full check: this asks
 // whether a path claims to be a launcher, and a file that claims to be one and then
@@ -71,12 +72,14 @@ bool ResolveSoLauncher(const std::string& path, SoLauncher& out, std::string* er
     if (n <= 0) return fail("the file is empty");
     buf[n] = '\0';
 
-    // Four lines, in order: the magic, the object, the entry, the arity. Anything past
-    // the fourth is ignored; a line that is not there ends the parse and is reported.
-    std::string lines[4];
+    // Five lines, in order: the magic, the object, the entry, the arity, and an
+    // optional number naming the process relationship (0 = let the server decide,
+    // 1 = fork, 2 = native child process, 3 = in this process). The fifth line may be
+    // absent, which is the same as 0; anything past it is ignored.
+    std::string lines[5];
     int li = 0;
     const char* p = buf;
-    while (li < 4 && p && *p) {
+    while (li < 5 && p && *p) {
         const char* e = strchr(p, '\n');
         std::string l = e ? std::string(p, (size_t)(e - p)) : std::string(p);
         while (!l.empty() && (l.back() == '\r' || l.back() == ' ' || l.back() == '\t'))
@@ -86,7 +89,7 @@ bool ResolveSoLauncher(const std::string& path, SoLauncher& out, std::string* er
     }
     if (li < 4) {
         char m[96];
-        snprintf(m, sizeof m, "expected 4 lines, but got %d", li);
+        snprintf(m, sizeof m, "expected at least 4 lines, but got %d", li);
         return fail(m);
     }
     if (lines[0] != IEC_SO_MAGIC) return fail("the first line is not " IEC_SO_MAGIC);
@@ -99,6 +102,13 @@ bool ResolveSoLauncher(const std::string& path, SoLauncher& out, std::string* er
     out.so = lines[1];
     out.entry = lines[2];
     out.arity = (lines[3] == "3") ? 3 : 2;
+    out.primary = PrimaryLaunchKind::kAuto;
+    if (li >= 5 && !lines[4].empty()) {
+        if (lines[4].size() != 1 || lines[4][0] < '0' || lines[4][0] > '3') {
+            return fail("the fifth line is not one of 0, 1, 2, 3");
+        }
+        out.primary = static_cast<PrimaryLaunchKind>(lines[4][0] - '0');
+    }
     return true;
 }
 

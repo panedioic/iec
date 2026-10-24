@@ -14,18 +14,38 @@
 
 #include "sock_operation.h"
 
-// How a program is started. ResolveKind() in exec_server.cpp picks one from the host
-// capabilities probed there; StartByKind() in the same file is what carries it out.
-enum class LaunchKind {
-    kAuto,          // nobody has decided yet
-    kExec,          // plain fork + execve
-    kSo,            // a shared object, entered through the loader
-    kLoader,        // a loader is executed in the program's place
-    kQemu_x86_64,   // emulated, qemu in the program's place
-    kQemu_aarch64,
-    kShebang,
-    kUnexecutable,  // no way to run this path
+// How a program is started. Two questions, kept apart because the platform offers
+// more than one way to get a separate process at all:
+//
+//   primary   -- what the new process *is* with respect to this one: a fork of the
+//                server (kFork), a process the platform creates and loads a library
+//                into (kNcp, HarmonyOS's native child process), or no new process
+//                at all (kInProc, not implemented).
+//   secondary -- how the program is entered once that process exists: execve, a
+//                shared object's entry, a loader, a script's interpreter, qemu.
+//
+// ResolveKind() answers the secondary question from the path; ChoosePrimary()
+// answers the primary one from the capabilities and from the launcher.
+enum class PrimaryLaunchKind {
+    kAuto    = 0,   // the launcher left the choice to the server
+    kFork    = 1,
+    kNcp     = 2,
+    kInProc  = 3,
 };
+
+enum class SecondaryLaunchKind {
+    kAuto         = 0,   // nobody has decided yet
+    kExec         = 1,    // plain execve
+    kSo           = 2,    // a shared object, entered through the dlopen
+    kLoader       = 3,
+    kShebang      = 4,
+    kQemu_x86_64  = 5,    // emulated, qemu in the program's place
+    kQemu_aarch64 = 6,
+    kUnexecutable = 0xff, // no way to run this path
+};
+
+// The mechanism is what most of the code names; keep the concise spelling.
+using LaunchKind = SecondaryLaunchKind;
 
 struct InheritedFd {
     int source_fd;
@@ -37,6 +57,7 @@ struct SpawnRequest {
     std::vector<std::string> argv;          // argv[0] is the command name
     std::vector<std::string> env;           // "K=V"
     std::string cwd;                        // empty is inherit
+    PrimaryLaunchKind prikind = PrimaryLaunchKind::kAuto;
     LaunchKind kind_hint = LaunchKind::kAuto;   // kAuto = the caller did not decide
     std::vector<InheritedFd> stdio_fds;     // target ∈ {0,1,2}
     std::vector<InheritedFd> extra_fds;     // target > 2; no request fills this yet
