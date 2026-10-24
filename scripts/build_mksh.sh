@@ -77,7 +77,7 @@ SRCS=(edit.c eval.c exec.c expr.c funcs.c histrap.c jobs.c lalloc.c lex.c
 WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat fstat
        chmod fchmod fchmodat
        open openat unlink unlinkat rename renameat access faccessat realpath
-       link linkat opendir readdir scandir fopen freopen syscall
+       link linkat opendir readdir scandir fopen freopen utimensat syscall
        close dup dup2 dup3 fcntl ioctl isatty ttyname ttyname_r
        tcgetattr tcsetattr tcgetpgrp tcsetpgrp getpt grantpt unlockpt ptsname
        openpty login_tty forkpty

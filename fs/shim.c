@@ -138,6 +138,7 @@ static int (*r_scandir)(const char*, struct dirent***,
                         int (*)(const struct dirent**, const struct dirent**));
 static long (*r_syscall)(long, ...);
 static int (*r_linkat)(int, const char*, int, const char*, int);
+static int (*r_utimensat)(int, const char*, const struct timespec[2], int);
 
 #ifdef INT_WARP
 /* Command .so mode: the real implementation is the linker-provided __real_<name>. Variadic
@@ -166,6 +167,7 @@ extern int __real_scandir(const char*, struct dirent***,
                           int (*)(const struct dirent**, const struct dirent**));
 extern long __real_syscall(long, ...);
 extern int __real_linkat(int, const char*, int, const char*, int);
+extern int __real_utimensat(int, const char*, const struct timespec[2], int);
 
 static int shim_real_openat(int dirfd, const char* p, int flags, ...) {
     va_list ap; va_start(ap, flags);
@@ -199,6 +201,9 @@ static long shim_real_syscall(long n, ...) {
     return __real_syscall(n, a1, a2, a3, a4, a5, a6);
 }
 static int shim_real_linkat(int od, const char* op, int nd, const char* np, int f) { return __real_linkat(od, op, nd, np, f); }
+static int shim_real_utimensat(int d, const char* p, const struct timespec t[2], int f) {
+    return __real_utimensat(d, p, t, f);
+}
 
 /* The two stdio functions (fopen/freopen) are library functions too, so they also go through __real_* */
 extern FILE* __real_fopen(const char*, const char*);
@@ -1124,6 +1129,33 @@ int IEC_EXPORT(fchmodat)(int dirfd, const char* path, mode_t mode, int flags) {
 }
 
 // ─────────────────────────── lstat / stat / fstatat ───────────────────────────
+
+// archive_write_disk() restores timestamps with utimensat(..., AT_SYMLINK_NOFOLLOW) after
+// creating a symlink. Our link is a marker file, so following the target would update the
+// wrong inode; set the marker's own timestamps instead. This is what lets a symlink entry
+// extract without "Can't restore time".
+int IEC_EXPORT(utimensat)(int dirfd, const char* path,
+                          const struct timespec times[2], int flags) {
+    if (!path) { errno = EFAULT; return -1; }
+
+    int (*fu)(int, const char*, const struct timespec[2], int) =
+        IEC_REAL(r_utimensat, utimensat);
+    if (!fu) { errno = ENOSYS; return -1; }
+
+    char cand[IEC_BUF], marker[IEC_BUF];
+    int isl = 0;
+    int r = last_component_cand(dirfd, path, cand, sizeof cand,
+                                marker, sizeof marker, &isl);
+    if (r < 0) return -1;
+    if (r == 0 && isl) return fu(AT_FDCWD, marker, times, 0);
+
+    char res[IEC_BUF];
+    int changed = 0;
+    int rr = resolve_at(dirfd, path, res, sizeof res, &changed);
+    if (rr < 0) return -1;
+    if (changed) return fu(AT_FDCWD, res, times, flags);
+    return fu(dirfd, path, times, flags);
+}
 
 int IEC_EXPORT(lstat)(const char* path, struct stat* buf) {
     if (iec_is_null(path) || iec_is_null(buf)) { errno = EFAULT; return -1; }
