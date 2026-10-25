@@ -56,3 +56,8 @@ export const writeTxtFile: (target: string, data: string) => number;
 // The caller decides where each file belongs.
 //   0 success, 1 no resource manager, 2 rawfile missing/empty, 3 write failed.
 export const copyRawFile: (rawName: string, dstPath: string) => number;
+
+// Copies every top-level file under rawfile "programs" into <fake root>/usr/bin,
+// strips a ".sh" suffix (code.sh -> code) and marks it executable. Returns the
+// number of files that could not be installed; 0 means all in place.
+export const installPrograms: () => number;

@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "rawfile/raw_dir.h"
 #include "rawfile/raw_file.h"
 #include "rawfile/raw_file_manager.h"
 
@@ -861,6 +862,66 @@ napi_value CopyRawFile(napi_env env, napi_callback_info info) {
     return IntResult(env, 0);
 }
 
+// Copies every top-level file under rawfile "programs" into <fake root>/usr/bin,
+// dropping a ".sh" suffix and marking the result executable (code.sh -> code).
+// Directories are skipped (only the flat launcher scripts belong there).
+// Returns the number of files that could not be installed; 0 means all in place.
+napi_value InstallPrograms(napi_env env, napi_callback_info /*info*/) {
+    if (!g_res_mgr) {
+        Logger::GetInstance()->LogE("[iec] installPrograms: resource manager is not set");
+        return IntResult(env, 1);
+    }
+
+    RawDir* dir = OH_ResourceManager_OpenRawDir(g_res_mgr, "programs");
+    if (!dir) {
+        Logger::GetInstance()->LogE("[iec] installPrograms: cannot open rawfile programs/");
+        return IntResult(env, 1);
+    }
+
+    const std::string dest_dir = std::string(FAKE_SYSROOT) + "/usr/bin";
+    if (!EnsureDirs(dest_dir)) {
+        OH_ResourceManager_CloseRawDir(dir);
+        return IntResult(env, 1);
+    }
+
+    int failed = 0;
+    int installed = 0;
+    const int count = OH_ResourceManager_GetRawFileCount(dir);
+    for (int i = 0; i < count; ++i) {
+        const char* raw_name = OH_ResourceManager_GetRawFileName(dir, i);
+        if (!raw_name) {
+            ++failed;
+            continue;
+        }
+
+        const std::string name = raw_name;
+        const std::string raw = "programs/" + name;
+        if (OH_ResourceManager_IsRawDir(g_res_mgr, raw.c_str())) continue;
+
+        // Install under the name the user types: strip the .sh suffix.
+        std::string target = name;
+        if (target.size() > 3 && target.compare(target.size() - 3, 3, ".sh") == 0)
+            target = target.substr(0, target.size() - 3);
+
+        std::vector<unsigned char> data;
+        const std::string dst = dest_dir + "/" + target;
+        if (!ReadRawFile(g_res_mgr, raw, &data) ||
+            !WriteFile(dst, data.data(), data.size(), 0755) ||
+            chmod(dst.c_str(), 0755) != 0) {
+            Logger::GetInstance()->LogW("[iec] installPrograms %s -> %s failed",
+                                        raw.c_str(), dst.c_str());
+            ++failed;
+            continue;
+        }
+        ++installed;
+    }
+    OH_ResourceManager_CloseRawDir(dir);
+
+    Logger::GetInstance()->LogI(
+        "[iec] installPrograms: %d installed, %d failed", installed, failed);
+    return IntResult(env, failed);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     // The logger has no OHOS dependency of its own. Register hilog as a custom
     // sink here, where the NAPI/hilog libraries are already linked.
@@ -896,6 +957,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"unpackResource",              nullptr, UnpackResource,            nullptr, nullptr, nullptr, napi_default, nullptr},
         {"writeTxtFile",                nullptr, WriteTxtFile,              nullptr, nullptr, nullptr, napi_default, nullptr},
         {"copyRawFile",                 nullptr, CopyRawFile,               nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"installPrograms",             nullptr, InstallPrograms,           nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;
