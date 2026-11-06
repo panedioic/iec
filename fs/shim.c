@@ -56,6 +56,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 // ───────────────────────────── spec constants ─────────────────────────────
@@ -70,6 +71,13 @@
 // "emulated chmod" section below.
 #define IEC_CHMOD_SUFFIX     ".IEC_CHMOD"
 #define IEC_CHMOD_SUFFIX_LEN (sizeof(IEC_CHMOD_SUFFIX) - 1)
+
+// A third marker, for timestamps the kernel refuses (futimens/utimensat on a
+// file owned by the file-manager service, for example). Its content is two
+// "sec.nsec" values, atime then mtime; the file it belongs to is its name
+// without this suffix. See the "emulated timestamps" section below.
+#define IEC_UTIME_SUFFIX     ".IEC_UTIME"
+#define IEC_UTIME_SUFFIX_LEN (sizeof(IEC_UTIME_SUFFIX) - 1)
 
 // Upper bound on the target string length. Real symlink(2) on Linux likewise reports
 // "target length > PATH_MAX-1 → ENAMETOOLONG" (measured: 4095 works, 5999 gives
@@ -139,6 +147,7 @@ static int (*r_scandir)(const char*, struct dirent***,
 static long (*r_syscall)(long, ...);
 static int (*r_linkat)(int, const char*, int, const char*, int);
 static int (*r_utimensat)(int, const char*, const struct timespec[2], int);
+static int (*r_futimens)(int, const struct timespec[2]);
 
 #ifdef INT_WARP
 /* Command .so mode: the real implementation is the linker-provided __real_<name>. Variadic
@@ -168,6 +177,7 @@ extern int __real_scandir(const char*, struct dirent***,
 extern long __real_syscall(long, ...);
 extern int __real_linkat(int, const char*, int, const char*, int);
 extern int __real_utimensat(int, const char*, const struct timespec[2], int);
+extern int __real_futimens(int, const struct timespec[2]);
 
 static int shim_real_openat(int dirfd, const char* p, int flags, ...) {
     va_list ap; va_start(ap, flags);
@@ -740,6 +750,10 @@ static int last_component_cand(int dirfd, const char* path,
 
 // ─────────────────────────── struct stat for a fabricated link ───────────────────────────
 
+/* Defined in the "emulated timestamps" section below; fill_link_stat() runs
+ * before it and must apply a timestamp sidecar to the link's marker file. */
+static void apply_utime_marker(const char* path, struct stat* st);
+
 // lstat of a real symlink: mode=S_IFLNK|0777, size=target string length, nlink=hard-link count,
 // blocks=0 (a fast symlink occupies no disk blocks), blksize=4096. Everything is matched item
 // by item here; st_dev/st_ino/owner/timestamps are taken from the marker file itself (it is
@@ -755,6 +769,9 @@ static int fill_link_stat(const char* marker, struct stat* buf) {
     if (tl < 0) return -1;
 
     memcpy(buf, &real, sizeof real);
+    /* The marker file is a regular file, so this applies before we turn the
+     * result into a synthetic symlink. */
+    apply_utime_marker(marker, buf);
     buf->st_mode = S_IFLNK | 0777;
     buf->st_size = (off_t)tl;
     buf->st_blocks = 0;
@@ -1128,6 +1145,246 @@ int IEC_EXPORT(fchmodat)(int dirfd, const char* path, mode_t mode, int flags) {
     return 0;
 }
 
+// ─────────────────────────── emulated timestamps (.IEC_UTIME) ───────────────────────────
+//
+// The same sandbox that refuses chmod on file-manager-owned files also refuses
+// futimens/utimensat with explicit times: the caller is not the inode owner, so
+// the kernel returns EPERM even though the directory is writable. bsdunzip is a
+// concrete victim (it restores the zip's mtime with futimens after extraction).
+//
+//     futimens(fd, {UTIME_NOW, mtime})        where the kernel says EPERM
+//     -> <path>.IEC_UTIME                     content "<atime> <mtime>", both "sec.nsec"
+//
+// Reads patch st_atim/st_mtim from the sidecar; the real open/read/write path is
+// untouched. Like .IEC_CHMOD, this emulates metadata, not access control.
+// Marker creation is best effort: when even that fails the original errno is
+// returned.
+
+static int utime_marker_name(const char* path, char* out, size_t outsz) {
+    size_t n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') n--;           /* "dir/" and "dir" name the same file */
+    if (n + IEC_UTIME_SUFFIX_LEN + 1 > outsz) { errno = ENAMETOOLONG; return -1; }
+    memcpy(out, path, n);
+    memcpy(out + n, IEC_UTIME_SUFFIX, IEC_UTIME_SUFFIX_LEN + 1);
+    return 0;
+}
+
+static int is_utime_marker_name(const char* name) {
+    size_t n = strlen(name);
+    return n > IEC_UTIME_SUFFIX_LEN &&
+           memcmp(name + n - IEC_UTIME_SUFFIX_LEN, IEC_UTIME_SUFFIX,
+                  IEC_UTIME_SUFFIX_LEN) == 0;
+}
+
+/* Sidecars are metadata, never user-visible directory entries. */
+static int is_sidecar_name(const char* name) {
+    return is_chmod_marker_name(name) || is_utime_marker_name(name);
+}
+
+static int parse_utime_pair(const char* buf, struct timespec* at, struct timespec* mt) {
+    char* end = NULL;
+    errno = 0;
+    long long asec = strtoll(buf, &end, 10);
+    if (end == buf || errno != 0 || *end != '.') return 0;
+    char* nend = NULL;
+    unsigned long ansec = strtoul(end + 1, &nend, 10);
+    if (nend == end + 1 || *nend != ' ' || ansec > 999999999UL) return 0;
+
+    const char* p = nend + 1;
+    errno = 0;
+    long long msec = strtoll(p, &end, 10);
+    if (end == p || errno != 0 || *end != '.') return 0;
+    unsigned long mnsec = strtoul(end + 1, &nend, 10);
+    if (nend == end + 1 || mnsec > 999999999UL) return 0;
+    while (*nend == ' ' || *nend == '\t' || *nend == '\r' || *nend == '\n') nend++;
+    if (*nend != '\0') return 0;
+
+    at->tv_sec = (time_t)asec;
+    at->tv_nsec = (long)ansec;
+    mt->tv_sec = (time_t)msec;
+    mt->tv_nsec = (long)mnsec;
+    return 1;
+}
+
+static int read_utime_marker(const char* path, struct timespec* at, struct timespec* mt) {
+    char marker[IEC_BUF];
+    if (utime_marker_name(path, marker, sizeof marker) < 0) return 0;
+
+    int (*fo)(int, const char*, int, ...) = IEC_REAL(r_openat, openat);
+    if (!fo) return 0;
+    int fd = fo(AT_FDCWD, marker, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return 0;
+
+    char buf[96];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    return parse_utime_pair(buf, at, mt);
+}
+
+static int write_utime_marker(const char* path, const struct timespec* at,
+                              const struct timespec* mt) {
+    char marker[IEC_BUF];
+    if (utime_marker_name(path, marker, sizeof marker) < 0) return -1;
+
+    int (*fo)(int, const char*, int, ...) = IEC_REAL(r_openat, openat);
+    if (!fo) { errno = ENOSYS; return -1; }
+    int fd = fo(AT_FDCWD, marker,
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+
+    char buf[96];
+    int len = snprintf(buf, sizeof buf, "%lld.%09ld %lld.%09ld\n",
+                       (long long)at->tv_sec, at->tv_nsec,
+                       (long long)mt->tv_sec, mt->tv_nsec);
+    if (len < 0 || (size_t)len >= sizeof buf) {
+        close(fd);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    ssize_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, (size_t)(len - off));
+        if (w <= 0) { int e = errno; close(fd); errno = e; return -1; }
+        off += w;
+    }
+    if (close(fd) != 0) return -1;
+    return 0;
+}
+
+static void remove_utime_marker(const char* path) {
+    char marker[IEC_BUF];
+    if (utime_marker_name(path, marker, sizeof marker) < 0) return;
+    int (*fu)(int, const char*, int) = IEC_REAL(r_unlinkat, unlinkat);
+    if (fu) fu(AT_FDCWD, marker, 0);
+}
+
+static void apply_utime_marker(const char* path, struct stat* st) {
+    if (!st || S_ISLNK(st->st_mode)) return;
+    struct timespec at, mt;
+    if (!read_utime_marker(path, &at, &mt)) return;
+    st->st_atim = at;
+    st->st_mtim = mt;
+}
+
+static void apply_utime_marker_at(int dirfd, const char* path, int changed,
+                                  const char* resolved, struct stat* st) {
+    if (changed) {
+        apply_utime_marker(resolved, st);
+        return;
+    }
+    char abs[IEC_BUF];
+    if (make_abs_at(dirfd, path, abs, sizeof abs) == 0) apply_utime_marker(abs, st);
+}
+
+static int utime_may_emulate(int e) {
+    switch (e) {
+        case EPERM:
+        case EACCES:
+        case EROFS:
+        case EOPNOTSUPP:
+        case ENOSYS:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int both_utime_omit(const struct timespec times[2]) {
+    return times != NULL &&
+           times[0].tv_nsec == UTIME_OMIT &&
+           times[1].tv_nsec == UTIME_OMIT;
+}
+
+/* Current values for UTIME_OMIT. The sidecar wins over the inode: a second
+ * UTIME_OMIT must not overwrite an already-emulated timestamp with the real
+ * (unchanged) inode value. */
+static int current_utime_values(const char* abs, const struct stat* cur,
+                                struct timespec out[2]) {
+    if (read_utime_marker(abs, &out[0], &out[1])) return 0;
+    if (cur != NULL) {
+        out[0] = cur->st_atim;
+        out[1] = cur->st_mtim;
+        return 0;
+    }
+    return -1;
+}
+
+/* Turn the caller's times[2] (which may contain UTIME_NOW / UTIME_OMIT) into
+ * two concrete values suitable for the sidecar. */
+static int resolve_utime_pair(const char* abs, const struct stat* cur,
+                              const struct timespec times[2],
+                              struct timespec out[2]) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return -1;
+
+    struct timespec base[2];
+    int have_base = 0;
+    for (int i = 0; i < 2; i++) {
+        if (times == NULL || times[i].tv_nsec == UTIME_NOW) {
+            out[i] = now;
+        } else if (times[i].tv_nsec == UTIME_OMIT) {
+            if (!have_base) {
+                if (current_utime_values(abs, cur, base) != 0) return -1;
+                have_base = 1;
+            }
+            out[i] = base[i];
+        } else {
+            out[i] = times[i];
+        }
+    }
+    return 0;
+}
+
+/* fstatat that never applies our sidecars (the fallback values must be the real
+ * inode values, not another layer of emulation). */
+static int utime_stat(int dirfd, const char* path, int flags, struct stat* st) {
+    int (*ff)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
+    if (!ff) return -1;
+    int f = 0;
+#ifdef AT_SYMLINK_NOFOLLOW
+    f = flags & AT_SYMLINK_NOFOLLOW;
+#endif
+    return ff(dirfd, path, st, f);
+}
+
+static int do_futimens(int fd, const struct timespec times[2]) {
+    if (both_utime_omit(times)) return 0;
+
+    int (*ff)(int, const struct timespec[2]) = IEC_REAL(r_futimens, futimens);
+    if (!ff) { errno = ENOSYS; return -1; }
+
+    if (ff(fd, times) == 0) {
+        char path[IEC_BUF];
+        if (fd_path(fd, path, sizeof path) == 0) remove_utime_marker(path);
+        return 0;
+    }
+
+    const int saved = errno;
+    if (!utime_may_emulate(saved)) { errno = saved; return -1; }
+
+    char path[IEC_BUF];
+    if (fd_path(fd, path, sizeof path) != 0) { errno = saved; return -1; }
+
+    struct stat cur;
+    int (*fs)(int, struct stat*) = IEC_REAL(r_fstat, fstat);
+    if (!fs || fs(fd, &cur) != 0) { errno = saved; return -1; }
+    if (S_ISLNK(cur.st_mode)) { errno = saved; return -1; }   /* 软链的时间戳不模拟 */
+
+    struct timespec at[2];
+    if (resolve_utime_pair(path, &cur, times, at) != 0 ||
+        write_utime_marker(path, &at[0], &at[1]) != 0) {
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
+int IEC_EXPORT(futimens)(int fd, const struct timespec times[2]) {
+    return do_futimens(fd, times);
+}
+
 // ─────────────────────────── lstat / stat / fstatat ───────────────────────────
 
 // archive_write_disk() restores timestamps with utimensat(..., AT_SYMLINK_NOFOLLOW) after
@@ -1136,25 +1393,71 @@ int IEC_EXPORT(fchmodat)(int dirfd, const char* path, mode_t mode, int flags) {
 // extract without "Can't restore time".
 int IEC_EXPORT(utimensat)(int dirfd, const char* path,
                           const struct timespec times[2], int flags) {
-    if (!path) { errno = EFAULT; return -1; }
-
     int (*fu)(int, const char*, const struct timespec[2], int) =
         IEC_REAL(r_utimensat, utimensat);
     if (!fu) { errno = ENOSYS; return -1; }
+
+    /* Linux also accepts a NULL path (fd-only form). Delegate it to the real
+     * implementation; emulation for that form is handled by futimens(). */
+    if (!path) return fu(dirfd, NULL, times, flags);
+    if (both_utime_omit(times)) return 0;
 
     char cand[IEC_BUF], marker[IEC_BUF];
     int isl = 0;
     int r = last_component_cand(dirfd, path, cand, sizeof cand,
                                 marker, sizeof marker, &isl);
     if (r < 0) return -1;
-    if (r == 0 && isl) return fu(AT_FDCWD, marker, times, 0);
 
-    char res[IEC_BUF];
-    int changed = 0;
-    int rr = resolve_at(dirfd, path, res, sizeof res, &changed);
-    if (rr < 0) return -1;
-    if (changed) return fu(AT_FDCWD, res, times, flags);
-    return fu(dirfd, path, times, flags);
+    const char* target = path;
+    int target_dirfd = dirfd;
+    int target_flags = flags;
+    if (r == 0 && isl) {
+        target = marker;
+        target_dirfd = AT_FDCWD;
+        target_flags = 0;
+    } else {
+        char res[IEC_BUF];
+        int changed = 0;
+        int rr = resolve_at(dirfd, path, res, sizeof res, &changed);
+        if (rr < 0) return -1;
+        if (changed) {
+            target = res;
+            target_dirfd = AT_FDCWD;
+        }
+    }
+
+    if (fu(target_dirfd, target, times, target_flags) == 0) {
+        char abs[IEC_BUF];
+        if (make_abs_at(target_dirfd, target, abs, sizeof abs) == 0)
+            remove_utime_marker(abs);
+        return 0;
+    }
+
+    const int saved = errno;
+    if (!utime_may_emulate(saved)) { errno = saved; return -1; }
+
+    struct stat cur;
+    if (utime_stat(target_dirfd, target, target_flags, &cur) != 0) {
+        errno = saved;
+        return -1;
+    }
+    /* 真软链 + AT_SYMLINK_NOFOLLOW：不能按路径建 sidecar（stat 会跟随到别的
+     * inode），保持原错误。模拟软链的 target 是 marker 文件本身（普通文件），
+     * 会正常走到下面的 sidecar；fill_link_stat() 再把它套回可见的链接。 */
+    if (S_ISLNK(cur.st_mode)) { errno = saved; return -1; }
+
+    char abs[IEC_BUF];
+    if (make_abs_at(target_dirfd, target, abs, sizeof abs) != 0) {
+        errno = saved;
+        return -1;
+    }
+    struct timespec at[2];
+    if (resolve_utime_pair(abs, &cur, times, at) != 0 ||
+        write_utime_marker(abs, &at[0], &at[1]) != 0) {
+        errno = saved;
+        return -1;
+    }
+    return 0;
 }
 
 int IEC_EXPORT(lstat)(const char* path, struct stat* buf) {
@@ -1174,7 +1477,10 @@ int IEC_EXPORT(lstat)(const char* path, struct stat* buf) {
     int (*fl)(const char*, struct stat*) = IEC_REAL(r_lstat, lstat);
     if (!fl) { errno = ENOSYS; return -1; }
     int rc = (r > 0) ? fl(path, buf) : fl(cand, buf);
-    if (rc == 0) apply_chmod_marker_at(AT_FDCWD, path, r == 0, cand, buf);
+    if (rc == 0) {
+        apply_chmod_marker_at(AT_FDCWD, path, r == 0, cand, buf);
+        apply_utime_marker_at(AT_FDCWD, path, r == 0, cand, buf);
+    }
     return rc;
 }
 
@@ -1188,7 +1494,10 @@ int IEC_EXPORT(stat)(const char* path, struct stat* buf) {
     int (*fs)(const char*, struct stat*) = IEC_REAL(r_stat, stat);
     if (!fs) { errno = ENOSYS; return -1; }
     int rc = fs(changed ? res : path, buf);
-    if (rc == 0) apply_chmod_marker_at(AT_FDCWD, path, changed, res, buf);
+    if (rc == 0) {
+        apply_chmod_marker_at(AT_FDCWD, path, changed, res, buf);
+        apply_utime_marker_at(AT_FDCWD, path, changed, res, buf);
+    }
     return rc;
 }
 
@@ -1205,7 +1514,10 @@ int IEC_EXPORT(fstatat)(int dirfd, const char* path, struct stat* buf, int flags
         int (*ff)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
         if (!ff) { errno = ENOSYS; return -1; }
         int rc = (r > 0) ? ff(dirfd, path, buf, flags) : ff(AT_FDCWD, cand, buf, flags);
-        if (rc == 0) apply_chmod_marker_at(dirfd, path, r == 0, cand, buf);
+        if (rc == 0) {
+            apply_chmod_marker_at(dirfd, path, r == 0, cand, buf);
+            apply_utime_marker_at(dirfd, path, r == 0, cand, buf);
+        }
         return rc;
     }
 #endif
@@ -1216,7 +1528,10 @@ int IEC_EXPORT(fstatat)(int dirfd, const char* path, struct stat* buf, int flags
     int (*ff)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
     if (!ff) { errno = ENOSYS; return -1; }
     int rc = (r > 0 || !changed) ? ff(dirfd, path, buf, flags) : ff(AT_FDCWD, res, buf, flags);
-    if (rc == 0) apply_chmod_marker_at(dirfd, path, changed, res, buf);
+    if (rc == 0) {
+        apply_chmod_marker_at(dirfd, path, changed, res, buf);
+        apply_utime_marker_at(dirfd, path, changed, res, buf);
+    }
     return rc;
 }
 
@@ -1229,7 +1544,10 @@ int IEC_EXPORT(fstat)(int fd, struct stat* buf) {
     int rc = ff(fd, buf);
     if (rc == 0) {
         char path[IEC_BUF];
-        if (fd_path(fd, path, sizeof path) == 0) apply_chmod_marker(path, buf);
+        if (fd_path(fd, path, sizeof path) == 0) {
+            apply_chmod_marker(path, buf);
+            apply_utime_marker(path, buf);
+        }
     }
     return rc;
 }
@@ -1340,10 +1658,18 @@ static int do_unlink(int dirfd, const char* path, int atflags) {
     int r = last_component_cand(dirfd, path, cand, sizeof cand, marker, sizeof marker, &isl);
     if (r < 0) return -1;
     if (r > 0) return fu(dirfd, path, atflags);
-    if (isl) return fu(AT_FDCWD, marker, 0);
+    if (isl) {
+        int rc = fu(AT_FDCWD, marker, 0);
+        if (rc == 0) remove_utime_marker(marker);
+        return rc;
+    }
 
     int rc = fu(AT_FDCWD, cand, atflags);
-    if (rc == 0) remove_chmod_marker(cand);   /* a deleted file must not keep its mode sidecar */
+    if (rc == 0) {
+        /* a deleted file must not keep its metadata sidecars */
+        remove_chmod_marker(cand);
+        remove_utime_marker(cand);
+    }
     return rc;
 }
 
@@ -1385,6 +1711,23 @@ static void move_chmod_marker(const char* oldp, const char* newp) {
     if (fs(AT_FDCWD, om, &st, AT_SYMLINK_NOFOLLOW) == 0) fr(om, nm);
 }
 
+// Move the timestamp sidecar with its file. A destination sidecar is removed
+// first: it described the file that is being replaced, not the one arriving.
+static void move_utime_marker(const char* oldp, const char* newp) {
+    char om[IEC_BUF], nm[IEC_BUF];
+    if (utime_marker_name(oldp, om, sizeof om) < 0 ||
+        utime_marker_name(newp, nm, sizeof nm) < 0) return;
+
+    int (*fu)(int, const char*, int) = IEC_REAL(r_unlinkat, unlinkat);
+    int (*fr)(const char*, const char*) = IEC_REAL(r_rename, rename);
+    int (*fs)(int, const char*, struct stat*, int) = IEC_REAL(r_fstatat, fstatat);
+    if (!fu || !fr || !fs) return;
+
+    fu(AT_FDCWD, nm, 0);
+    struct stat st;
+    if (fs(AT_FDCWD, om, &st, AT_SYMLINK_NOFOLLOW) == 0) fr(om, nm);
+}
+
 static int do_rename(int od, const char* oldp, int nd, const char* newp) {
     if (!oldp || !newp) { errno = EFAULT; return -1; }
     int (*fr)(const char*, const char*) = IEC_REAL(r_rename, rename);
@@ -1405,7 +1748,10 @@ static int do_rename(int od, const char* oldp, int nd, const char* newp) {
 
     if (!oisl && !nisl) {                            // no links involved → real rename
         int rc = fr(ocand, ncand);
-        if (rc == 0) move_chmod_marker(ocand, ncand);
+        if (rc == 0) {
+            move_chmod_marker(ocand, ncand);
+            move_utime_marker(ocand, ncand);
+        }
         return rc;
     }
 
@@ -1419,10 +1765,15 @@ static int do_rename(int od, const char* oldp, int nd, const char* newp) {
     if (marker_name(ncand, dst, sizeof dst) < 0) return -1;
     int rc = fr(src, dst);
     if (rc == 0) {
-        // The visible destination is a link (or the source was one): a mode
-        // sidecar belongs to neither, so drop both leftovers.
+        // The link's timestamp sidecar belongs to the marker file, so move it
+        // to the destination marker. The visible name's sidecars belong to
+        // neither side and are dropped.
+        move_utime_marker(src, dst);
+        remove_utime_marker(src);
         remove_chmod_marker(ncand);
         remove_chmod_marker(ocand);
+        remove_utime_marker(ncand);
+        remove_utime_marker(ocand);
     }
     return rc;
 }
@@ -1637,7 +1988,7 @@ struct dirent* IEC_EXPORT(readdir)(DIR* dirp) {
     for (;;) {
         struct dirent* e = fr(dirp);
         if (!e) return NULL;
-        if (is_chmod_marker_name(e->d_name)) continue;   /* metadata, not a user entry */
+        if (is_sidecar_name(e->d_name)) continue;   /* metadata, not a user entry */
         unmark_dirent(e);
         return e;
     }
@@ -1674,7 +2025,7 @@ int IEC_EXPORT(scandir)(const char* path, struct dirent*** namelist,
         int kept = 0;
         for (int i = 0; i < n; i++) {
             struct dirent* e = (*namelist)[i];
-            if (e && is_chmod_marker_name(e->d_name)) {
+            if (e && is_sidecar_name(e->d_name)) {
                 free(e);                              /* hidden metadata file */
                 continue;
             }
