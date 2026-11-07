@@ -554,11 +554,10 @@ static int virt_exe_self(const char* path, char* out, size_t outsz) {
 /* ── path mapping table ────────────────────────────────────────────────────────────
  * Rewrites absolute paths that guests have "hard-coded at compile time but do not exist in
  * the sandbox's read-only root" to our directories.
- * Currently there is only one entry:
- *   /usr/share/X11/xkb — libxkbcommon hard-codes its include path to this (measured: it does
- *   **not** honor XKB_CONFIG_ROOT). The guest's / is the read-only app root, the directory
- *   does not exist → "failed to add default include path" → then it dereferences null in
- *   xkb_context_include_path_*, SIGSEGV(139), and the process dies in about 3 seconds.
+ * Note on /usr/share/X11/xkb: libxkbcommon hard-codes its include path to this (measured:
+ * it does **not** honor XKB_CONFIG_ROOT in all versions). The xkb data is unpacked at
+ * $IEC_SYSROOT/usr/share/X11/xkb — the standard FHS location — so the catch-all "/usr"
+ * entry below resolves it like any other /usr path; no special entry needed any more.
  * It lives here (rather than in a separate preload) because this function is the common entry
  * point for whole paths.
  * When adding entries note: `to_rel` is a path relative to $IEC_SYSROOT. */
@@ -578,7 +577,6 @@ static const struct { const char* from; const char* to_rel; } kPathMap[] = {
     { "/vendor/bin", "vendor/bin" },
     { "/system/lib", "system/lib" },
     { "/data/app/bin", "data/app/bin" },
-    { "/usr/share/X11/xkb", "usr/share/x11/xkb" },
     /* Guests have **no real root filesystem**; absolute paths such as `/usr/...` do not exist
      * on the host. Debs installed by apt are full of these: code-server's
      * `usr/bin/code-server` contains
@@ -586,7 +584,8 @@ static const struct { const char* from; const char* to_rel; } kPathMap[] = {
      * mksh stats the path itself before exec'ing, and if the mapping is missing it only
      * reports "inaccessible or not found" — execve is never even reached (so procmgr's
      * fallback cannot help either).
-     * This entry covers all of /usr/...; it is the coarsest, hence last. */
+     * This entry covers all of /usr/... (including /usr/share/X11/xkb); it is the coarsest,
+     * hence last. */
     { "/usr", "usr" },
 };
 
@@ -596,7 +595,7 @@ static const char* map_path(const char* path, char* buf, size_t bufsz) {
     for (size_t i = 0; i < sizeof kPathMap / sizeof kPathMap[0]; i++) {
         size_t n = strlen(kPathMap[i].from);
         if (strncmp(path, kPathMap[i].from, n) != 0) continue;
-        if (path[n] != '\0' && path[n] != '/') continue;   /* don't match /usr/share/X11/xkbevil by accident */
+        if (path[n] != '\0' && path[n] != '/') continue;   /* don't match /usr/bin/xkbevil by accident */
         snprintf(buf, bufsz, "%s/%s%s", root, kPathMap[i].to_rel, path + n);
         iec_trace("[shim] map_path: %s -> %s\n", path, buf);
         return buf;
