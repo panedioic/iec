@@ -76,6 +76,14 @@ enum CallMethod {
     CALL_EXECVE, CALL_EXECV, CALL_EXECVP, CALL_EXECVPE,
     CALL_EXECL, CALL_EXECLP, CALL_EXECLE,
 
+    /* posix_spawn / posix_spawnp. Unlike the exec* family above, the caller is
+     * NOT replaced: the request only asks the server to create the child, and
+     * the shim hands the child's pid straight back to the caller, which waits
+     * for it itself (the shim's waitpid answers from the server's exit records,
+     * since the child's real parent is the server). SPAWN does not search PATH;
+     * SPAWNP does -- the same split as execve/execvp. */
+    CALL_POSIX_SPAWN, CALL_POSIX_SPAWNP,
+
     /* Not a call method, and never sent: the count, so that a request carrying a
      * method can be checked against a bound instead of against the last member by
      * name (which would silently widen the check if a member were ever added).

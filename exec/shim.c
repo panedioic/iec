@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -357,8 +359,13 @@ static unsigned kept_mask(char *const env[]) {
     return mask;
 }
 
-static int exec_common(enum CallMethod method, const char *file,
-                       char *const argv[], char *const envp[]) {
+/* Build the OP_EXECUTE request for (method, file, argv, envp), send it with the
+ * caller's stdio attached, and hand back the pid the server started. Returns
+ * -1 with errno set on failure. Shared by the exec* family (whose caller then
+ * becomes the stand-in) and by posix_spawn (whose caller gets the pid and
+ * waits itself). */
+static pid_t send_exec_request(enum CallMethod method, const char *file,
+                               char *const argv[], char *const envp[]) {
     /* Compact request for OP_EXECUTE. Everything is length-delimited by the
      * packet itself plus NUL terminators, and the decoder checks the buffer end
      * as it walks, so a truncated or hostile request cannot run off it:
@@ -549,16 +556,186 @@ static int exec_common(enum CallMethod method, const char *file,
         return -1;
     }
 
-    /* A program is running on the server, so this call succeeds from here on: what
-     * is left is to take that program's place, which never returns. Close the
-     * descriptors execve would have closed first; see close_cloexec_fds(). */
-    close_cloexec_fds();
-    become_stand_in(iec_get32(answer));
+    /* A program is running on the server and its pid is the answer. The closer
+     * (stand-in vs. plain return) is the caller's business: exec* replaces this
+     * process (close the descriptors execve would have closed first, see
+     * close_cloexec_fds(), then become the stand-in), while posix_spawn hands
+     * the pid back with this process -- and its descriptors -- untouched. */
+    return (pid_t)iec_get32(answer);
 
 too_long:
     report("[shim] exec: request is too long\n");
     errno = E2BIG;
     return -1;
+}
+
+/* exec* tail: once the request succeeds this process stops being itself -- it
+ * becomes the stand-in, waits for the server-side child and exits with its
+ * status (see become_stand_in). */
+static int exec_common(enum CallMethod method, const char *file,
+                       char *const argv[], char *const envp[]) {
+    pid_t child = send_exec_request(method, file, argv, envp);
+    if (child < 0) return -1;
+    close_cloexec_fds();
+    become_stand_in((uint32_t)child);
+    /* unreachable */
+    errno = EIO;
+    return -1;
+}
+
+/* ── posix_spawn / posix_spawnp ────────────────────────────────────────
+ *
+ * Semantics: the parent returns immediately with a pid, and the caller waits
+ * for that pid. No middle process, no stand-in: the request goes out with
+ * CALL_POSIX_SPAWN/SPAWNP and the pid of the child the server forked is handed
+ * straight back to the caller.
+ *
+ * The cost: the child's real parent is the server, not the caller, so the
+ * caller's waitpid would fail with ECHILD. The waitpid interception below
+ * answers for it instead: every pid this process posix_spawned is recorded in
+ * g_spawned, and a waitpid on it is served through the same OP_WAIT polling
+ * protocol become_stand_in uses (the server's procmap keeps the exit status
+ * even after the server has reaped the child).
+ *
+ * file_actions/attrp are not interpreted: programs that rely on their finer
+ * points don't get that part of the semantics yet (same as the old shim). */
+static struct { pid_t pid; int used; } g_spawned[32];
+
+static void spawned_track(pid_t pid) {
+    size_t i;
+    for (i = 0; i < sizeof g_spawned / sizeof g_spawned[0]; i++) {
+        if (!g_spawned[i].used || g_spawned[i].pid == pid) {
+            g_spawned[i].pid = pid;
+            g_spawned[i].used = 1;
+            return;
+        }
+    }
+    /* Table full: the oldest slot gives way (a posix_spawn caller almost
+     * always waits in the order it spawned). */
+    for (i = 1; i < sizeof g_spawned / sizeof g_spawned[0]; i++)
+        g_spawned[i - 1] = g_spawned[i];
+    g_spawned[sizeof g_spawned / sizeof g_spawned[0] - 1] = (typeof(g_spawned[0])){pid, 1};
+}
+
+static int spawned_is_tracked(pid_t pid) {
+    size_t i;
+    for (i = 0; i < sizeof g_spawned / sizeof g_spawned[0]; i++)
+        if (g_spawned[i].used && g_spawned[i].pid == pid) return 1;
+    return 0;
+}
+
+static void spawned_drop(pid_t pid) {
+    size_t i;
+    for (i = 0; i < sizeof g_spawned / sizeof g_spawned[0]; i++)
+        if (g_spawned[i].used && g_spawned[i].pid == pid) g_spawned[i].used = 0;
+}
+
+/* posix_spawn tail: ask the server once (WNOHANG) or poll (blocking), and
+ * hand the wait status the server recorded to the caller's waitpid. Returns:
+ *   pid  -- *status filled in (the child has ended)
+ *   0    -- WNOHANG and the child is still running
+ *   -1   -- the server could not be reached (errno = EIO; no local meaning
+ *           is available at that point) */
+static pid_t wait_spawned(pid_t pid, int *status, int blocking) {
+    const struct timespec interval = { 0, EXEC_WAIT_INTERVAL_MS * 1000000L };
+    uint8_t req[4], answer[8];
+    uint32_t len, state;
+    struct timespec left, rem;
+
+    body_put32(req, (uint32_t)pid);
+    for (;;) {
+        len = 0;
+        if (rpc_call(OP_WAIT, req, sizeof req, answer, sizeof answer, &len) < 0 ||
+            len < sizeof answer) {
+            report("[shim] waitpid: lost the child's exit status\n");
+            errno = EIO;
+            return -1;
+        }
+        state = iec_get32(answer);
+        if (state == 1) {
+            spawned_drop(pid);
+            if (status) *status = (int)iec_get32(answer + 4);
+            return pid;
+        }
+        if (!blocking) return 0;
+
+        left = interval;
+        while (nanosleep(&left, &rem) < 0 && errno == EINTR) left = rem;
+    }
+}
+
+int IEC_EXPORT(posix_spawn)(pid_t *pid, const char *file,
+                            const void *file_actions, const void *attrp,
+                            char *const argv[], char *const envp[]) {
+    (void)file_actions;
+    (void)attrp;
+
+    /* posix_spawn does not search PATH (semantically it is execve). */
+    pid_t child = send_exec_request(CALL_POSIX_SPAWN, file, argv,
+                                    envp ? envp : (char *const *)environ);
+    if (child < 0) return -1;
+    spawned_track(child);
+    if (pid) *pid = child;
+    return 0;
+}
+
+int IEC_EXPORT(posix_spawnp)(pid_t *pid, const char *file,
+                             const void *file_actions, const void *attrp,
+                             char *const argv[], char *const envp[]) {
+    /* spawnp's PATH search happens on the server (the same road as execvp);
+     * file is passed as-is. */
+    pid_t child = send_exec_request(CALL_POSIX_SPAWNP, file, argv,
+                                    envp ? envp : (char *const *)environ);
+    if (child < 0) return -1;
+    spawned_track(child);
+    if (pid) *pid = child;
+    return 0;
+}
+
+/* waitpid: the children this process posix_spawned are not its children in
+ * the kernel's eyes (their real parent is the server), so a bare waitpid would
+ * fail with ECHILD. A pid hit in g_spawned is answered from the server's exit
+ * records; everything else (really forked children, -1/0 and other wildcards)
+ * goes to libc as-is.
+ * Limitations, stated honestly: WUNTRACED/WCONTINUED are not simulated (the
+ * server only records exits and signal deaths), and wait()/waitid() are
+ * implemented inside libc where this symbol never lands -- they still fail
+ * with ECHILD for posix_spawned children. Callers that use waitpid (clang's
+ * ExecuteAndWait and friends) are unaffected. */
+int IEC_EXPORT(waitpid)(pid_t pid, int *status, int options) {
+    int st = 0;
+
+    if (pid > 0 && spawned_is_tracked(pid)) {
+        pid_t r = wait_spawned(pid, &st, !(options & WNOHANG));
+        if (r < 0) return -1;
+        if (r == 0) return 0;              /* WNOHANG: still running */
+        if (status) *status = st;
+        return pid;
+    }
+
+    /* Not one of our posix_spawned children -- a child this process really
+     * forked (or a wildcard), and the kernel is the authority there. This
+     * sandbox's waitpid is a wait4 wrapper: nr 260 on aarch64. */
+    return (int)syscall(SYS_wait4, pid, status, options, NULL);
+}
+
+/* wait4: this is how LLVM's ExecuteAndWait waits for its children (the
+ * llvm::sys::wait4 wrapper in Program.inc); same logic as the waitpid
+ * interception. rusage cannot be reconstructed -- it is zeroed (ExecuteAndWait
+ * runs without ProcStat by default, so nobody reads it). */
+int IEC_EXPORT(wait4)(pid_t pid, int *status, int options, struct rusage *rusage) {
+    int st = 0;
+
+    if (pid > 0 && spawned_is_tracked(pid)) {
+        pid_t r = wait_spawned(pid, &st, !(options & WNOHANG));
+        if (r < 0) return -1;
+        if (r == 0) return 0;              /* WNOHANG: still running */
+        if (status) *status = st;
+        if (rusage) memset(rusage, 0, sizeof(struct rusage));
+        return pid;
+    }
+
+    return (int)syscall(SYS_wait4, pid, status, options, rusage);
 }
 
 /* ------------------------------------------------------------------ */
@@ -615,52 +792,4 @@ int IEC_EXPORT(execle)(const char *path, const char *arg0, ...) {
     return exec_common(CALL_EXECLE, path, argv, envp);
 }
 
-/* ── posix_spawn ──────────────────────────────────────────────────────
- *
- * Semantics: the parent returns immediately with a pid, and whoever spawned
- * waits for that pid. The real child is created by the exec server (its parent
- * is the server, not us), so there is no waitable pid to hand back -- the same
- * shape the old procmgr shim solved with a "middle process" trick, kept here
- * word for word: fork() a middle process that plays the child. It delegates
- * through exec_common -- which ends in become_stand_in, i.e. it waits for the
- * server's child and exits with its status -- so the caller's waitpid(middle)
- * reports the real child's exit status.
- *
- * Why this must be intercepted at all: glibc's own posix_spawn runs the child
- * on clone(CLONE_VM|CLONE_VFORK) -- the "child" shares our address space until
- * it execs, so our delegation (malloc, socket, RPC) must never run there. With
- * the interception, that code path is never taken (measured: the SDK's clang
- * driver posix_spawns ld.lld at link time; without this it failed with
- * "posix_spawn failed: Permission denied" and every -o link died).
- *
- * file_actions/attrp are not interpreted: programs that rely on their finer
- * points don't get that part of the semantics yet (same as the old shim). */
-static int spawn_via_middle(enum CallMethod method, pid_t *pid, const char *file,
-                            char *const argv[], char *const envp[]) {
-    pid_t p = fork();
-    if (p < 0) return errno;
-    if (p == 0) {
-        /* 中间进程：委托成功就永不返回（替身带着真孩子的退出码退出）；
-         * 失败时把原因打成一行再 _exit(127) —— 调用方只看得到一个退出码，
-         * 没有这行日志就只剩 `FAILED: [code=127]`，无从排查（旧 shim 同款）。 */
-        exec_common(method, file, argv, envp ? envp : (char *const *)environ);
-        report("[shim] posix_spawn failed (see errno above)\n");
-        _exit(127);
-    }
-    if (pid) *pid = p;
-    return 0;
-}
 
-int IEC_EXPORT(posix_spawn)(pid_t *pid, const char *file,
-                            const void *file_actions, const void *attrp,
-                            char *const argv[], char *const envp[]) {
-    /* posix_spawn 不搜 PATH（语义上就是 execve）。 */
-    return spawn_via_middle(CALL_EXECVE, pid, file, argv, envp);
-}
-
-int IEC_EXPORT(posix_spawnp)(pid_t *pid, const char *file,
-                             const void *file_actions, const void *attrp,
-                             char *const argv[], char *const envp[]) {
-    /* spawnp 的 PATH 搜索交给 exec server（与 execvp 同一条路），file 原样传。 */
-    return spawn_via_middle(CALL_EXECVP, pid, file, argv, envp);
-}

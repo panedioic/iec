@@ -143,6 +143,7 @@ static bool SearchesPath(CallMethod method) {
         case CALL_EXECVP:
         case CALL_EXECVPE:
         case CALL_EXECLP:
+        case CALL_POSIX_SPAWNP:      /* posix_spawnp searches PATH; posix_spawn does not */
             return true;
         default:
             break;
@@ -173,6 +174,11 @@ static bool ReplacesCaller(CallMethod method) {
         case CALL_EXECLP:
         case CALL_EXECLE:
             return true;
+        case CALL_POSIX_SPAWN:
+        case CALL_POSIX_SPAWNP:
+            /* The caller keeps running after posix_spawn; the child it gets is
+             * recorded under the caller as its logical parent. */
+            return false;
         case CALL_METHOD_END:
             break;
     }
