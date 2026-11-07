@@ -130,7 +130,7 @@ make -C "$BUILD" install > "$BUILD/install.log" 2>&1 \
 FS_WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat fstat
           chmod fchmod fchmodat
           open openat unlink unlinkat rename renameat access faccessat realpath
-          link linkat opendir readdir scandir fopen freopen utimensat futimens syscall)
+          link linkat opendir readdir scandir fopen freopen utimensat futimens posix_spawn posix_spawnp syscall)
 FS_WRAP_FLAGS=()
 for name in "${FS_WRAPS[@]}"; do
 	FS_WRAP_FLAGS+=("-Wl,--wrap=$name")

@@ -614,3 +614,53 @@ int IEC_EXPORT(execle)(const char *path, const char *arg0, ...) {
     va_end(ap);
     return exec_common(CALL_EXECLE, path, argv, envp);
 }
+
+/* ── posix_spawn ──────────────────────────────────────────────────────
+ *
+ * Semantics: the parent returns immediately with a pid, and whoever spawned
+ * waits for that pid. The real child is created by the exec server (its parent
+ * is the server, not us), so there is no waitable pid to hand back -- the same
+ * shape the old procmgr shim solved with a "middle process" trick, kept here
+ * word for word: fork() a middle process that plays the child. It delegates
+ * through exec_common -- which ends in become_stand_in, i.e. it waits for the
+ * server's child and exits with its status -- so the caller's waitpid(middle)
+ * reports the real child's exit status.
+ *
+ * Why this must be intercepted at all: glibc's own posix_spawn runs the child
+ * on clone(CLONE_VM|CLONE_VFORK) -- the "child" shares our address space until
+ * it execs, so our delegation (malloc, socket, RPC) must never run there. With
+ * the interception, that code path is never taken (measured: the SDK's clang
+ * driver posix_spawns ld.lld at link time; without this it failed with
+ * "posix_spawn failed: Permission denied" and every -o link died).
+ *
+ * file_actions/attrp are not interpreted: programs that rely on their finer
+ * points don't get that part of the semantics yet (same as the old shim). */
+static int spawn_via_middle(enum CallMethod method, pid_t *pid, const char *file,
+                            char *const argv[], char *const envp[]) {
+    pid_t p = fork();
+    if (p < 0) return errno;
+    if (p == 0) {
+        /* 中间进程：委托成功就永不返回（替身带着真孩子的退出码退出）；
+         * 失败时把原因打成一行再 _exit(127) —— 调用方只看得到一个退出码，
+         * 没有这行日志就只剩 `FAILED: [code=127]`，无从排查（旧 shim 同款）。 */
+        exec_common(method, file, argv, envp ? envp : (char *const *)environ);
+        report("[shim] posix_spawn failed (see errno above)\n");
+        _exit(127);
+    }
+    if (pid) *pid = p;
+    return 0;
+}
+
+int IEC_EXPORT(posix_spawn)(pid_t *pid, const char *file,
+                            const void *file_actions, const void *attrp,
+                            char *const argv[], char *const envp[]) {
+    /* posix_spawn 不搜 PATH（语义上就是 execve）。 */
+    return spawn_via_middle(CALL_EXECVE, pid, file, argv, envp);
+}
+
+int IEC_EXPORT(posix_spawnp)(pid_t *pid, const char *file,
+                             const void *file_actions, const void *attrp,
+                             char *const argv[], char *const envp[]) {
+    /* spawnp 的 PATH 搜索交给 exec server（与 execvp 同一条路），file 原样传。 */
+    return spawn_via_middle(CALL_EXECVP, pid, file, argv, envp);
+}
