@@ -148,7 +148,14 @@ std::string ResolveRelativePath(const std::string& path, const std::string& cwd)
 
 std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env,
                             const std::string& cwd) {
-    if (path.find('/') != std::string::npos) return ResolveRelativePath(path, cwd);
+    if (path.find('/') != std::string::npos) {
+        /* An absolute path may still name a system prefix (/bin, /usr/bin, ...)
+         * that only exists under the fake root — the caller may have resolved
+         * PATH itself (posix_spawn callers like CPython do), so apply the
+         * mapping here too; UnderFakeRoot leaves other paths unchanged. */
+        if (path[0] == '/') return UnderFakeRoot(path);
+        return ResolveRelativePath(path, cwd);
+    }
 
     const std::string dirs = PathForRequest(env);
     size_t start = 0;

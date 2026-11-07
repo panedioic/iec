@@ -15,6 +15,7 @@
 
 #include "../common/constant.h"
 #include "../loader/loader.h"
+#include "logger/logger.h"
 
 #include <elf.h>
 #include <fcntl.h>
@@ -197,6 +198,30 @@ void EnsureGlibcTunable(std::vector<std::string>* env) {
     EnvSet(env, "GLIBC_TUNABLES", old + kItem);
 }
 
+// The preload shim (fs/exec/tty interception, INT_PRELOAD form) only exists for
+// the libc it was compiled against: a musl-built shim preloaded into a glibc
+// process crashes at load time and the other way round, which is why the old
+// procmgr kept two builds and picked one by the guest's PT_INTERP. This host
+// only ships the glibc build (the kLoader route is the glibc guest route; musl
+// guests are command .so's entered through kSo, which carry the shim inside).
+//
+// Why the shim matters: the SIGSYS downgrade installed before entering the
+// image dies with the process's first execve() (exec resets handlers), and the
+// sandbox answers unknown syscalls with SIGSYS. The shim keeps the loop closed:
+// its exec family delegates back to the exec server (which forks a fresh child
+// and installs the downgrade again), and its syscall wrapper answers the
+// io_uring_setup probe with ENOSYS before a signal is ever raised. This is the
+// IEC counterpart of procmgr's ChildRunElf shim selection.
+void EnsureGuestShim(const std::string& interp, std::vector<std::string>* env) {
+    if (interp.find("ld-musl") != std::string::npos) return;   // musl guest: no shim shipped
+
+    const std::string shim = std::string(IEC_BUNDLE_LIBS) + "libiec_preload.so";
+    struct stat st;
+    if (stat(shim.c_str(), &st) != 0) return;   // not shipped: stay compatible
+
+    EnvPrepend(env, "LD_PRELOAD", shim);
+}
+
 // Try the literal PT_INTERP path first (host builds and real /lib), then the
 // same basename in the bundle's native-library directory and the fake sysroot.
 bool ReadInterpImage(const std::string& interp, std::vector<unsigned char>* out) {
@@ -248,10 +273,33 @@ pid_t SpawnLoader(const SpawnRequest& req) {
     libs += IEC_BUNDLE_LIBS;
     EnvPrepend(&env, "LD_LIBRARY_PATH", libs);
 
+    /* The interpreter decides more than the image entry: the preload shim is
+     * libc-specific, so read it before the environment is frozen. */
+    const std::string interp = ReadInterp(req.path);
+
     /* Same reason as the old procmgr: a foreign glibc registers rseq during
      * startup and the sandbox turns that syscall into SIGSYS. The bundled
      * glibc is patched, but guests carrying their own libc still need it. */
     EnsureGlibcTunable(&env);
+
+    /* /proc/self/exe for the guest: this process never exec'd (the image was
+     * mapped in-process), so the kernel's /proc/self/exe still points at the
+     * app binary -- and anything that locates itself through it (hdc spawning
+     * its server is the concrete victim) would re-exec the app. The fs shim
+     * answers readlink/stat of /proc/self/exe from IEC_GUEST_EXE; set it to
+     * the guest's own path, exactly what procmgr's ChildRunElf did with
+     * BSH_GUEST_EXE. */
+    {
+        char gxbuf[4096];
+        const char* gx = realpath(req.path.c_str(), gxbuf) ? gxbuf : req.path.c_str();
+        EnvSet(&env, "IEC_GUEST_EXE", gx);
+    }
+
+    /* Guest-internal execve must loop back into the exec server (handler +
+     * environment reinstall on the new process); without the shim the first
+     * exec resets the SIGSYS downgrade and the child dies on the next seccomp
+     * trap (hdc start spawning its server is the concrete victim). */
+    EnsureGuestShim(interp, &env);
 
     std::vector<char*> envp;
     envp.reserve(env.size() + 1);
@@ -264,27 +312,36 @@ pid_t SpawnLoader(const SpawnRequest& req) {
     // A dynamic image is entered through its interpreter: map both images and
     // start at the interpreter's entry, which relocates the main image and
     // calls its entry. A static image is entered directly.
-    const std::string interp = ReadInterp(req.path);
     if (!interp.empty()) {
         std::vector<unsigned char> main_img, ldso_img;
-        if (Slurp(req.path, &main_img) && ReadInterpImage(interp, &ldso_img)) {
-            const int rc = elf_run_dyn_inproc(main_img.data(), main_img.size(),
-                                              ldso_img.data(), ldso_img.size(),
-                                              argc, argv.data());
-            if (rc < 0) return -1;
-            fflush(nullptr);
-            _exit(rc & 0xff);
+        if (!Slurp(req.path, &main_img)) {
+            Logger::GetInstance()->LogE("[exec] loader: cannot read %s", req.path.c_str());
+            return -1;
         }
-        /* Do NOT fall through to elf_run_file() here: a dynamic ET_DYN entered
-         * without its interpreter has no relocations and jumps to a raw entry
-         * (SIGSEGV). Report the real problem and let the caller exit 127. */
-        fprintf(stderr, "[exec] loader: cannot read %s or its interpreter %s\n",
-                req.path.c_str(), interp.c_str());
-        return -1;
+        if (!ReadInterpImage(interp, &ldso_img)) {
+            Logger::GetInstance()->LogE("[exec] loader: cannot read interpreter %s",
+                                        interp.c_str());
+            return -1;
+        }
+        const int rc = elf_run_dyn_inproc(main_img.data(), main_img.size(),
+                                          ldso_img.data(), ldso_img.size(),
+                                          argc, argv.data());
+        if (rc < 0) {
+            Logger::GetInstance()->LogE(
+                "[exec] loader: in-process load of %s failed rc=%d errno=%d",
+                req.path.c_str(), rc, errno);
+            return -1;
+        }
+        fflush(nullptr);
+        _exit(rc & 0xff);
     }
 
     const int rc = elf_run_file(req.path.c_str(), argc, argv.data());
-    if (rc < 0) return -1;
+    if (rc < 0) {
+        Logger::GetInstance()->LogE("[exec] loader: static load of %s failed errno=%d",
+                                    req.path.c_str(), errno);
+        return -1;
+    }
     fflush(nullptr);
     _exit(rc & 0xff);
 }

@@ -784,6 +784,20 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
          * shell's (this is what made "./clang" look like an unexecutable file). */
         sr.path = ResolveRelativePath(file, sr.cwd);
     }
+
+    /* A PATH segment that only exists under the fake root maps to a path that
+     * may not exist at all (/data/app/bin/hdc from a caller's PATH search, for
+     * example). execve(2) semantics for it are ENOENT -- and callers that walk
+     * a candidate list (CPython's child_exec) only skip to the next candidate
+     * on ENOENT, so reporting "unexecutable" here would end the whole search
+     * with a 127 instead of reaching the entry that does exist. */
+    struct stat exec_st;
+    if (stat(sr.path.c_str(), &exec_st) != 0) {
+        Logger::GetInstance()->LogW("[exec] %s: %s", sr.path.c_str(), strerror(errno));
+        put32(reply.body, 0);
+        put32(reply.body, static_cast<uint32_t>(ENOENT));
+        return true;
+    }
     sr.kind_hint = ResolveKind(sr.path);
 
     // A request turns into a real process whose stdio is the caller's: the fds
