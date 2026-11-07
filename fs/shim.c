@@ -1564,6 +1564,39 @@ int IEC_EXPORT(fstat)(int fd, struct stat* buf) {
 // Non-static with the iec_ prefix: when merged with the tty module into the same guest shim,
 // the unified open() in open_shim.c calls it (both modules want to take over open, so there
 // can be only one entry point).
+
+// The file-manager service behind /storage/Users coerces the mode of files
+// created there (a requested 0755 lands as 0660, owner file_manager), so exec
+// bits passed to open(O_CREAT) are lost. bsdunzip is a concrete victim: it
+// passes the archive's mode ONLY to open() and never chmods afterwards, and a
+// plain chmod would be EPERM anyway (the app is not the inode owner). When a
+// created regular file lacks exec bits the caller asked for, record the
+// requested mode in a .IEC_CHMOD sidecar — the same emulation chmod uses.
+// Callers in normal directories (open(0755) honored) get no sidecar: the
+// fstat comparison finds nothing to emulate.
+static void emulate_creat_mode(int fd, int flags, mode_t mode) {
+    if (!(flags & O_CREAT) || !(mode & 0111)) return;
+
+    int (*fs)(int, struct stat*) = IEC_REAL(r_fstat, fstat);
+    if (!fs) return;
+    struct stat st;
+    if (fs(fd, &st) != 0 || !S_ISREG(st.st_mode)) return;
+    if ((st.st_mode & 0111) == (mode & 0111)) return;   /* kernel honored it */
+
+    char path[IEC_BUF];
+    if (fd_path(fd, path, sizeof path) != 0) return;
+    (void)write_chmod_marker(path, mode & 07777);
+}
+
+/* Open through the real implementation, then apply the creat-mode emulation.
+ * Every iec_fs_do_open() return path goes through here. */
+static int do_open_real(int fd_arg, const char* p, int flags, mode_t mode) {
+    int (*fa)(int, const char*, int, ...) = IEC_REAL(r_openat, openat);
+    int fd = fa(fd_arg, p, flags, mode);
+    if (fd >= 0) emulate_creat_mode(fd, flags, mode);
+    return fd;
+}
+
 int iec_fs_do_open(int dirfd, const char* path, int flags, mode_t mode) {
     if (!path) { errno = EFAULT; return -1; }
     int (*fa)(int, const char*, int, ...) = IEC_REAL(r_openat, openat);
@@ -1574,23 +1607,23 @@ int iec_fs_do_open(int dirfd, const char* path, int flags, mode_t mode) {
         int isl = 0;
         int r = last_component_cand(dirfd, path, cand, sizeof cand, marker, sizeof marker, &isl);
         if (r < 0) return -1;
-        if (r > 0) return fa(dirfd, path, flags, mode);
+        if (r > 0) return do_open_real(dirfd, path, flags, mode);
         if (isl) {
 #ifdef O_PATH
-            if (flags & O_PATH) return fa(AT_FDCWD, marker, flags, mode);
+            if (flags & O_PATH) return do_open_real(AT_FDCWD, marker, flags, mode);
 #endif
             errno = ELOOP;
             return -1;
         }
-        return fa(AT_FDCWD, cand, flags, mode);
+        return do_open_real(AT_FDCWD, cand, flags, mode);
     }
 
     char res[IEC_BUF];
     int changed = 0;
     int cr = resolve_at(dirfd, path, res, sizeof res, &changed);
     if (cr < 0) return -1;
-    if (cr > 0 || !changed) return fa(dirfd, path, flags, mode);
-    return fa(AT_FDCWD, res, flags, mode);
+    if (cr > 0 || !changed) return do_open_real(dirfd, path, flags, mode);
+    return do_open_real(AT_FDCWD, res, flags, mode);
 }
 
 #ifndef IEC_SHIM_MERGED_OPEN
