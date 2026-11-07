@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -865,12 +866,44 @@ napi_value CopyRawFile(napi_env env, napi_callback_info info) {
 // Copies every top-level file under rawfile "programs" into <fake root>/usr/bin,
 // dropping a ".sh" suffix and marking the result executable (code.sh -> code).
 // Directories are skipped (only the flat launcher scripts belong there).
+//
+// Some launchers are one script serving many command names: llvm.sh dispatches
+// on $0 to the same-named tool inside the user's commandline-tools SDK. Those
+// are listed in kAliases and installed once per name.
 // Returns the number of files that could not be installed; 0 means all in place.
 napi_value InstallPrograms(napi_env env, napi_callback_info /*info*/) {
     if (!g_res_mgr) {
         Logger::GetInstance()->LogE("[iec] installPrograms: resource manager is not set");
         return IntResult(env, 1);
     }
+
+    // raw name -> the extra command names the script answers to. Keep in sync
+    // with the kRenames table in feature/bsh_main's shell.cpp (legacy path).
+    static const std::pair<const char*, const char*> kAliases[] = {
+        {"llvm.sh", "clang"},
+        {"llvm.sh", "clang++"},
+        {"llvm.sh", "clang-15"},
+        {"llvm.sh", "clang-cpp"},
+        {"llvm.sh", "clangd"},
+        {"llvm.sh", "ld.lld"},
+        {"llvm.sh", "lld"},
+        {"llvm.sh", "llvm-ar"},
+        {"llvm.sh", "llvm-nm"},
+        {"llvm.sh", "llvm-objcopy"},
+        {"llvm.sh", "llvm-objdump"},
+        {"llvm.sh", "llvm-ranlib"},
+        {"llvm.sh", "llvm-readelf"},
+        {"llvm.sh", "llvm-readobj"},
+        {"llvm.sh", "llvm-size"},
+        {"llvm.sh", "llvm-strip"},
+        {"llvm.sh", "llvm-strings"},
+        {"llvm.sh", "llvm-symbolizer"},
+        {"llvm.sh", "llvm-cov"},
+        {"llvm.sh", "llvm-profdata"},
+        {"llvm.sh", "llvm-config"},
+        {"llvm.sh", "aarch64-unknown-linux-ohos-clang"},
+        {"llvm.sh", "aarch64-unknown-linux-ohos-clang++"},
+    };
 
     RawDir* dir = OH_ResourceManager_OpenRawDir(g_res_mgr, "programs");
     if (!dir) {
@@ -883,6 +916,19 @@ napi_value InstallPrograms(napi_env env, napi_callback_info /*info*/) {
         OH_ResourceManager_CloseRawDir(dir);
         return IntResult(env, 1);
     }
+
+    auto install = [&dest_dir](const std::string& raw, const std::string& name) -> bool {
+        std::vector<unsigned char> data;
+        const std::string dst = dest_dir + "/" + name;
+        if (!ReadRawFile(g_res_mgr, raw, &data) ||
+            !WriteFile(dst, data.data(), data.size(), 0755) ||
+            chmod(dst.c_str(), 0755) != 0) {
+            Logger::GetInstance()->LogW("[iec] installPrograms %s -> %s failed",
+                                        raw.c_str(), dst.c_str());
+            return false;
+        }
+        return true;
+    };
 
     int failed = 0;
     int installed = 0;
@@ -898,18 +944,22 @@ napi_value InstallPrograms(napi_env env, napi_callback_info /*info*/) {
         const std::string raw = "programs/" + name;
         if (OH_ResourceManager_IsRawDir(g_res_mgr, raw.c_str())) continue;
 
+        // Every alias gets its own copy under the name the user types.
+        bool aliased = false;
+        for (const auto& a : kAliases) {
+            if (name != a.first) continue;
+            aliased = true;
+            if (install(raw, a.second)) ++installed;
+            else ++failed;
+        }
+        if (aliased) continue;
+
         // Install under the name the user types: strip the .sh suffix.
         std::string target = name;
         if (target.size() > 3 && target.compare(target.size() - 3, 3, ".sh") == 0)
             target = target.substr(0, target.size() - 3);
 
-        std::vector<unsigned char> data;
-        const std::string dst = dest_dir + "/" + target;
-        if (!ReadRawFile(g_res_mgr, raw, &data) ||
-            !WriteFile(dst, data.data(), data.size(), 0755) ||
-            chmod(dst.c_str(), 0755) != 0) {
-            Logger::GetInstance()->LogW("[iec] installPrograms %s -> %s failed",
-                                        raw.c_str(), dst.c_str());
+        if (!install(raw, target)) {
             ++failed;
             continue;
         }

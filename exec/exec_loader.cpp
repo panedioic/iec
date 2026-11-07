@@ -18,6 +18,7 @@
 
 #include <elf.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,6 +106,55 @@ std::string DirName(const std::string& path) {
     return path.substr(0, slash);
 }
 
+// ── SIGSYS downgrade, same semantics the old procmgr installed ──────────────
+//
+// The sandbox's seccomp does not return an errno for unknown syscalls: with
+// SECCOMP_RET_TRAP it raises SIGSYS and kills the process (rc=159) unless a
+// handler is installed. Returning normally from the handler makes the trapped
+// call end with -ENOSYS, which is exactly what a real kernel without the
+// syscall does -- and what guests expect (libuv falls back to epoll, glibc to
+// the non-rseq/clone3 paths, ...). Guests run in this very process, so a
+// handler installed before entering the image covers the whole guest.
+//
+// The handler must be async-signal-safe: no printf/malloc/getenv. The trace
+// switch is read once, up front, and the number is written by hand.
+
+static int g_sigsys_trace = 0;
+
+static void SigSysWriteDec(int fd, long v) {
+    char b[24];
+    int i = (int)sizeof b;
+    bool neg = v < 0;
+    unsigned long u = neg ? (unsigned long)(-v) : (unsigned long)v;
+    if (u == 0) b[--i] = '0';
+    while (u) { b[--i] = (char)('0' + (u % 10)); u /= 10; }
+    if (neg) b[--i] = '-';
+    ssize_t r = write(fd, b + i, sizeof b - (size_t)i);
+    (void)r;
+}
+
+static void SigSysToEnosys(int, siginfo_t* info, void*) {
+    if (g_sigsys_trace) {
+        static const char pre[] = "[exec] SIGSYS syscall=";
+        if (write(STDERR_FILENO, pre, sizeof pre - 1)) {}
+        // si_syscall is stable since Linux 4.14; 0 when unavailable.
+        SigSysWriteDec(STDERR_FILENO, info ? (long)info->si_syscall : 0);
+        static const char nl[] = "\n";
+        if (write(STDERR_FILENO, nl, 1)) {}
+    }
+    /* Return: the kernel completes the trapped syscall with -ENOSYS. */
+}
+
+static void InstallSigSysDowngrade() {
+    g_sigsys_trace = getenv("IEC_SIGSYS_TRACE") ? 1 : 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = SigSysToEnosys;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSYS, &sa, nullptr);
+}
+
 // "K=V" vector helpers. The environment passed to elf_run_dyn_inproc is the
 // vector built below, not the process's own env, so changes have to land there.
 std::string EnvGet(const std::vector<std::string>& env, const char* key) {
@@ -176,6 +226,11 @@ pid_t SpawnLoader(const SpawnRequest& req) {
         static const char msg[] = "[exec] chdir failed, started in default path\n";
         if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}
     }
+
+    /* Guests hit seccomp traps (rseq/io_uring/...) that kill the process with
+     * SIGSYS; downgrading them to -ENOSYS is the whole guest survival story of
+     * the old procmgr. Install before entering any image. */
+    InstallSigSysDowngrade();
 
     std::vector<char*> argv;
     argv.reserve(req.argv.size() + 1);
