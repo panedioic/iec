@@ -778,7 +778,11 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
             Logger::GetInstance()->LogI("[exec] %s resolved to %s",
                                         file.c_str(), sr.path.c_str());
     } else {
-        sr.path = file;
+        /* execv()/execve() do not search PATH, but an explicit relative path is
+         * still relative to the *caller's* cwd. Resolve it here: the classifier
+         * and the loader both run in the server process, whose cwd is not the
+         * shell's (this is what made "./clang" look like an unexecutable file). */
+        sr.path = ResolveRelativePath(file, sr.cwd);
     }
     sr.kind_hint = ResolveKind(sr.path);
 

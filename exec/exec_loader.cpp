@@ -4,8 +4,16 @@
 // and entering the image here is safe: a guest's exit_group ends only this
 // child. Dynamic images are entered through their PT_INTERP; static images
 // are entered at their own entry.
+//
+// The interpreter is looked up by basename in the bundle's native-library
+// directory, not at the literal PT_INTERP path. The sandbox has no /lib (its
+// glibc lives under /data/storage/el1/bundle/libs/arm64), so a dynamic guest
+// whose PT_INTERP says /lib/ld-linux-aarch64.so.1 would otherwise never start.
+// The same directory is added to LD_LIBRARY_PATH so the interpreter can find
+// libc.so.6, libpthread.so.0, libstdc++.so.6 and the rest.
 #include "exec_loader.h"
 
+#include "../common/constant.h"
 #include "../loader/loader.h"
 
 #include <elf.h>
@@ -85,6 +93,82 @@ std::string ReadInterp(const std::string& path) {
     return interp;
 }
 
+std::string BaseName(const std::string& path) {
+    const size_t slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+std::string DirName(const std::string& path) {
+    const size_t slash = path.rfind('/');
+    if (slash == std::string::npos) return std::string();
+    if (slash == 0) return "/";
+    return path.substr(0, slash);
+}
+
+// "K=V" vector helpers. The environment passed to elf_run_dyn_inproc is the
+// vector built below, not the process's own env, so changes have to land there.
+std::string EnvGet(const std::vector<std::string>& env, const char* key) {
+    const std::string prefix = std::string(key) + "=";
+    for (const std::string& e : env) {
+        if (e.compare(0, prefix.size(), prefix) == 0) return e.substr(prefix.size());
+    }
+    return std::string();
+}
+
+void EnvSet(std::vector<std::string>* env, const char* key, const std::string& value) {
+    const std::string prefix = std::string(key) + "=";
+    for (std::string& e : *env) {
+        if (e.compare(0, prefix.size(), prefix) == 0) {
+            e = prefix + value;
+            return;
+        }
+    }
+    env->push_back(prefix + value);
+}
+
+void EnvPrepend(std::vector<std::string>* env, const char* key, const std::string& item) {
+    if (item.empty()) return;
+    const std::string prefix = std::string(key) + "=";
+    for (std::string& e : *env) {
+        if (e.compare(0, prefix.size(), prefix) == 0) {
+            const std::string old = e.substr(prefix.size());
+            e = prefix + (old.empty() ? item : item + ":" + old);
+            return;
+        }
+    }
+    env->push_back(prefix + item);
+}
+
+void EnsureGlibcTunable(std::vector<std::string>* env) {
+    static const char kItem[] = "glibc.pthread.rseq=0";
+    std::string old = EnvGet(*env, "GLIBC_TUNABLES");
+    if (old.find(kItem) != std::string::npos) return;
+    if (!old.empty()) old += ":";
+    EnvSet(env, "GLIBC_TUNABLES", old + kItem);
+}
+
+// Try the literal PT_INTERP path first (host builds and real /lib), then the
+// same basename in the bundle's native-library directory and the fake sysroot.
+bool ReadInterpImage(const std::string& interp, std::vector<unsigned char>* out) {
+    if (interp.empty()) return false;
+
+    const std::string base = BaseName(interp);
+    std::vector<std::string> cands;
+    /* Bundle first: on device this is the runtime the HAP was built with, and
+     * it is also what the old procmgr used. The literal path is only a host
+     * fallback; it must not shadow the bundle's loader. */
+    if (!base.empty()) {
+        cands.push_back(std::string(IEC_BUNDLE_LIBS) + base);
+        cands.push_back(std::string(FAKE_SYSROOT) + "/lib/" + base);
+        cands.push_back(std::string(FAKE_SYSROOT) + "/lib64/" + base);
+    }
+    cands.push_back(interp);
+    for (const std::string& c : cands) {
+        if (Slurp(c, out)) return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 pid_t SpawnLoader(const SpawnRequest& req) {
@@ -98,9 +182,25 @@ pid_t SpawnLoader(const SpawnRequest& req) {
     for (const std::string& s : req.argv) argv.push_back(const_cast<char*>(s.c_str()));
     argv.push_back(nullptr);
 
+    /* The loader will need the bundle's runtime and, for app-local layouts, the
+     * executable's own directory. The guest directory goes first (an app's
+     * same-named library must win over the bundle's), then the bundle libs.
+     * The caller's existing LD_LIBRARY_PATH stays behind both. */
+    std::vector<std::string> env = req.env;
+    const std::string guest_dir = DirName(req.path);
+    std::string libs = guest_dir;
+    if (!libs.empty()) libs += ":";
+    libs += IEC_BUNDLE_LIBS;
+    EnvPrepend(&env, "LD_LIBRARY_PATH", libs);
+
+    /* Same reason as the old procmgr: a foreign glibc registers rseq during
+     * startup and the sandbox turns that syscall into SIGSYS. The bundled
+     * glibc is patched, but guests carrying their own libc still need it. */
+    EnsureGlibcTunable(&env);
+
     std::vector<char*> envp;
-    envp.reserve(req.env.size() + 1);
-    for (const std::string& s : req.env) envp.push_back(const_cast<char*>(s.c_str()));
+    envp.reserve(env.size() + 1);
+    for (std::string& s : env) envp.push_back(const_cast<char*>(s.c_str()));
     envp.push_back(nullptr);
     environ = envp.data();
 
@@ -112,7 +212,7 @@ pid_t SpawnLoader(const SpawnRequest& req) {
     const std::string interp = ReadInterp(req.path);
     if (!interp.empty()) {
         std::vector<unsigned char> main_img, ldso_img;
-        if (Slurp(req.path, &main_img) && Slurp(interp, &ldso_img)) {
+        if (Slurp(req.path, &main_img) && ReadInterpImage(interp, &ldso_img)) {
             const int rc = elf_run_dyn_inproc(main_img.data(), main_img.size(),
                                               ldso_img.data(), ldso_img.size(),
                                               argc, argv.data());
@@ -120,8 +220,12 @@ pid_t SpawnLoader(const SpawnRequest& req) {
             fflush(nullptr);
             _exit(rc & 0xff);
         }
+        /* Do NOT fall through to elf_run_file() here: a dynamic ET_DYN entered
+         * without its interpreter has no relocations and jumps to a raw entry
+         * (SIGSEGV). Report the real problem and let the caller exit 127. */
         fprintf(stderr, "[exec] loader: cannot read %s or its interpreter %s\n",
                 req.path.c_str(), interp.c_str());
+        return -1;
     }
 
     const int rc = elf_run_file(req.path.c_str(), argc, argv.data());

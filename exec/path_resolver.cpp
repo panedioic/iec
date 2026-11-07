@@ -129,9 +129,26 @@ std::string UnderFakeRoot(const std::string& path) {
     return ResolveSimulated(mapped, "");
 }
 
+std::string ResolveRelativePath(const std::string& path, const std::string& cwd) {
+    if (path.empty()) return path;
+
+    /* Absolute paths can still be simulated symlinks (clang -> clang-15 in an
+     * extracted toolchain). Resolve them here instead of relying on the caller's
+     * fs shim: the exec service's own stat/open cannot see .IEC_SYMLINK. */
+    if (path[0] == '/') return ResolveSimulated(path, cwd);
+
+    /* A bare name is a PATH search; only explicit paths are cwd-relative. */
+    if (path.find('/') == std::string::npos) return path;
+
+    std::string rel = path;
+    while (rel.rfind("./", 0) == 0) rel = rel.substr(2);
+    if (rel.empty() || cwd.empty()) return path;
+    return ResolveSimulated(cwd + "/" + rel, cwd);
+}
+
 std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env,
                             const std::string& cwd) {
-    if (path.find('/') != std::string::npos) return path;
+    if (path.find('/') != std::string::npos) return ResolveRelativePath(path, cwd);
 
     const std::string dirs = PathForRequest(env);
     size_t start = 0;

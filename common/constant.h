@@ -19,6 +19,7 @@
 #define PATH_QEMU_X86_64_SO     "/data/storage/el1/bundle/libs/arm64/libqemu-x86_64.so"
 #define PATH_QEMU_AARCH64_SO    "/data/storage/el1/bundle/libs/arm64/libqemu-aarch64.so"
 #define FAKE_SYSROOT            "/data/storage/el2/base/files"
+#define IEC_BUNDLE_LIBS         "/data/storage/el1/bundle/libs/arm64/"
 #define IEC_LOG_DIR             "/data/storage/el2/base/files/logs"
 #define IEC_DEFAULT_HOME        "/data/storage/el2/base/files/home"
 
@@ -66,6 +67,13 @@
 
 #ifndef FAKE_SYSROOT
 #define FAKE_SYSROOT "/workspace/dev/iec/dist/fake_sysroot"
+#endif
+
+/* The signed bundle's native-library directory. On device it holds the glibc and
+ * musl runtimes that the in-process loader needs (the sandbox has no /lib). A
+ * host build falls back to the fake sysroot's lib directory. */
+#ifndef IEC_BUNDLE_LIBS
+#define IEC_BUNDLE_LIBS FAKE_SYSROOT "/lib/"
 #endif
 
 /* The runtime home, when the host does not export one. On OHOS it is the

@@ -20,6 +20,11 @@
 // they are relative to a working directory -- and so is the empty string.
 std::string UnderFakeRoot(const std::string& path);
 
+// A relative path that contains a slash is relative to the caller's cwd, not to
+// the server's. Absolute paths and bare names (no slash) are returned unchanged.
+// This is also the first step of ResolveFilePath() for explicit paths.
+std::string ResolveRelativePath(const std::string& path, const std::string& cwd);
+
 // The path a name is started from: searched in PATH when it has no slash of its own, or
 // empty when nothing matches. Runs in the parent, before the fork.
 std::string ResolveFilePath(const std::string& path, const std::vector<std::string>& env,
