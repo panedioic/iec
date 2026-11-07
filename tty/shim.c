@@ -160,7 +160,18 @@ static void tty_copy(int from, int to) {
  * survive an exec. login_tty() records the pts number in the environment, and
  * this constructor rebuilds the mapping for fds 0..2 in the new image, so that
  * the shell still sees a tty. The terminal state itself is on the server and
- * needs no rebuilding. */
+ * needs no rebuilding.
+ *
+ * ⚠ Trust only **evidence**: a pty of ours in this sandbox is one end of a
+ * socketpair (S_ISSOCK), which /dev/null, a pipe and a redirected file are not.
+ * The exec chain carries the caller's IEC_TTY_PTS down in the env as-is (this
+ * bit the "stdio redirected to a file" shape of runs like autorun-all: node
+ * ran tcgetattr against a pty that was not behind its fds, the server found no
+ * such pts, err != 0, and the assert at node.cc:661 killed it with SIGABRT --
+ * node/npm all died; ls misread stdout as a tty and columnated, so
+ * `ls | wc -l` came up one line short). So fstat for a socket before marking
+ * here; with a stale env it is better for isatty to answer "no" -- that is the
+ * answer the real kernel would give anyway. */
 __attribute__((constructor))
 static void shim_resume_from_exec(void) {
     const char *env = getenv(IEC_TTY_ENV);
@@ -169,9 +180,26 @@ static void shim_resume_from_exec(void) {
     if (!env || *env < '0' || *env > '9') return;
     n = atoi(env);
     for (fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+        struct stat st;
         if (fcntl(fd, F_GETFD) < 0) continue;
+        if (fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode)) continue;
         tty_set(fd, n, 0);
     }
+}
+
+/* Whether stdio really is one of our ptys -- for exec/shim.c: when the caller's
+ * stdio is not a pty, the IEC_TTY_PTS entry in the request env is stale poison
+ * for the child (see above) and must be stripped. */
+static int identify(int fd);
+int iec_tty_stdio_is_pty(void) {
+    int fd;
+    for (fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+        struct stat st;
+        if (fcntl(fd, F_GETFD) < 0) continue;
+        if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode) && identify(fd) >= 0)
+            return 1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */

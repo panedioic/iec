@@ -425,12 +425,31 @@ static int exec_common(enum CallMethod method, const char *file,
     while (argv && argv[argc]) argc++;
     while (env && env[envc]) envc++;
 
+    /* IEC_TTY_PTS only describes "the child's fd 0..2 are some pty". The child's
+     * stdio is the caller's stdio (passed as-is via SCM_RIGHTS), so when the
+     * caller's stdio is not a pty this entry is stale poison in the env: the
+     * child's constructor would mislabel its fds as a pty, and programs that
+     * run tty initialization on their stdio die on it (measured with
+     * autorun-all: node/npm all died on it, ls misread stdout as a tty and
+     * columnated). Strip it from the request env in that case, so the child
+     * runs on its real stdio. When the caller's stdio really is a pty, keep it
+     * (the main path of starting commands from a terminal). */
+    extern int iec_tty_stdio_is_pty(void) __attribute__((weak));
+    int drop_tty_pts = 0;
+    if (iec_tty_stdio_is_pty && !iec_tty_stdio_is_pty()) {
+        size_t k;
+        for (k = 0; k < envc; k++) {
+            if (strncmp(env[k], "IEC_TTY_PTS=", 12) == 0) { drop_tty_pts = 1; break; }
+        }
+    }
+
     /* Which variables that environment has to be given, decided here because the
      * header below carries the count of them; the entries themselves are appended
      * further down. Zero when it already names every entry of g_kept, so an
      * ordinary request goes out exactly as it did before. */
     kept = kept_mask(env);
     for (i = 0; i < (size_t)KEPT_COUNT; i++) kept_n += (kept >> i) & 1u;
+    if (drop_tty_pts) envc--;              /* keep the header count in step with what gets written */
 
     /* The child is started on the server, so our own stdio -- the terminal this
      * exec was called from -- has to travel with the request; without it the
@@ -477,7 +496,21 @@ static int exec_common(enum CallMethod method, const char *file,
     PUT_CSTR(file);
     PUT_CSTR(cwd);                         /* empty means inherit; see above */
     for (i = 0; i < argc; i++) PUT_CSTR(argv[i]);
-    for (i = 0; i < envc; i++) PUT_CSTR(env[i]);
+    if (drop_tty_pts) {
+        /* Upper bound must be the ORIGINAL entry count: envc was decremented
+         * before the header, and iterating to it would drop the last env entry,
+         * leaving the body shorter than the header declares -- the server then
+         * fails with "string is not terminated" (measured). */
+        size_t written = 0;
+        for (i = 0; i < envc + 1; i++) {
+            if (strncmp(env[i], "IEC_TTY_PTS=", 12) == 0) continue;
+            PUT_CSTR(env[i]);
+            written++;
+        }
+        envc = written;                    /* in step with the actual writes (header already counted -1) */
+    } else {
+        for (i = 0; i < envc; i++) PUT_CSTR(env[i]);
+    }
     /* Last, so the caller's own order is what the program reads first. The mask is
      * what says which of them; getenv() cannot answer NULL for one it names, since
      * kept_mask() only sets a bit for a variable this process was given. */
