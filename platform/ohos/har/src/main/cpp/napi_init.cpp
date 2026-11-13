@@ -917,6 +917,8 @@ napi_value InstallPrograms(napi_env env, napi_callback_info /*info*/) {
         return IntResult(env, 1);
     }
 
+    EnsureDirs(std::string(FAKE_SYSROOT) + "/tmp");
+
     auto install = [&dest_dir](const std::string& raw, const std::string& name) -> bool {
         std::vector<unsigned char> data;
         const std::string dst = dest_dir + "/" + name;

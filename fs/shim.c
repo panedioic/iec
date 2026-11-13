@@ -46,6 +46,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -577,6 +578,13 @@ static const struct { const char* from; const char* to_rel; } kPathMap[] = {
     { "/vendor/bin", "vendor/bin" },
     { "/system/lib", "system/lib" },
     { "/data/app/bin", "data/app/bin" },
+    /* Guests and guest-spawned tooling hardcode /tmp for scratch files (the
+     * kimi CLI and anything it launches are concrete victims). The directory
+     * itself is created by the application bootstrap next to bin/ — without
+     * it every mapped open fails ENOENT and the entry would be worse than
+     * none. mktemp(1) keeps using $TMPDIR, which the session rc aims at the
+     * app cache; this entry is for the scripts that never heard of TMPDIR. */
+    { "/tmp", "tmp" },
     /* Guests have **no real root filesystem**; absolute paths such as `/usr/...` do not exist
      * on the host. Debs installed by apt are full of these: code-server's
      * `usr/bin/code-server` contains
@@ -1485,7 +1493,46 @@ int IEC_EXPORT(lstat)(const char* path, struct stat* buf) {
 
 int IEC_EXPORT(stat)(const char* path, struct stat* buf) {
     if (iec_is_null(path) || iec_is_null(buf)) { errno = EFAULT; return -1; }
-    iec_trace("[shim] stat(%s)\n", path);
+    /* The return address names the caller: with IEC_SHIM_TRACE on it turns a
+     * trace storm like the stat(".") loop into an exact culprit (offset into
+     * the guest object, resolved against the map). For a storm of wild jumps
+     * -- lr garbage, one call site repeated -- the frame-pointer chain walked
+     * here names the real callers instead: a live frame's x29 chain is the
+     * only thing a corrupted control flow cannot rewrite retroactively. */
+    {
+        /* Runaway guard plus an opt-in caller/fp-chain dump, everything gated
+         * on IEC_SHIM_TRACE. The chain names the real callers of a trace
+         * storm even when lr itself is garbage (wild jumps rewrite registers,
+         * not the frames below). Gated because the depth counter is
+         * cumulative for the whole process: an unconditional guard would
+         * SIGKILL a long session once it had stat()ed 20000 times. */
+        if (iec_trace_on()) {
+            static int iec_stat_depth = 0;
+            int d = ++iec_stat_depth;
+            if (d > 20000) raise(SIGKILL);
+            if (d <= 8 || d % 2000 == 0) {
+                char b[1024];
+                int n = snprintf(b, sizeof b, "[shim] stat(%s) from=%p d=%d",
+                                 path, __builtin_return_address(0), d);
+                unsigned long fp = (unsigned long)__builtin_frame_address(0);
+                int w = n;
+                for (int i = 0; i < 14 && fp; i++) {
+                    unsigned long* f = (unsigned long*)fp;
+                    unsigned long next = f[0];
+                    unsigned long ret = f[1];
+                    if (next <= fp || next - fp > 0x100000) break;
+                    n = snprintf(b + w, sizeof b - (size_t)w, " %lx", ret);
+                    if (n <= 0 || (size_t)n >= sizeof b - (size_t)w) break;
+                    w += n;
+                    fp = next;
+                }
+                n = snprintf(b + w, sizeof b - (size_t)w, "\n");
+                (void)n;
+                ssize_t r = write(2, b, strlen(b));
+                (void)r;
+            }
+        }
+    }
     char res[IEC_BUF];
     int changed = 0;
     int r = resolve_at(AT_FDCWD, path, res, sizeof res, &changed);
@@ -1681,6 +1728,26 @@ int IEC_EXPORT(openat64)(int dirfd, const char* path, int flags, ...) {
 
 static int do_unlink(int dirfd, const char* path, int atflags) {
     if (!path) { errno = EFAULT; return -1; }
+    /* IEC crash forensics: a runaway do_unlink chain ate a 16 MB guest stack
+     * once (measured: bash 5.2 under the exec service, SIGSEGV with sp in the
+     * thread guard page and lr inside this function). Raw write() to fd 2, no
+     * stdio; the first 200 calls carry the path, after that only a depth
+     * counter. IEC_UNLINK_TRACE=0 silences it. */
+    static int iec_ul_depth = 0;
+    const char* quiet = getenv("IEC_UNLINK_TRACE");
+    if (quiet && quiet[0] && quiet[0] != '0') {
+        int d = ++iec_ul_depth;
+        if (d <= 200) {
+            char b[512];
+            int n = snprintf(b, sizeof b, "[unlink] d=%d dirfd=%d path=%s\n",
+                             d, dirfd, path);
+            if (n > 0) { ssize_t r = write(2, b, (size_t)n); (void)r; }
+        } else if (d % 1000 == 0) {
+            char b[64];
+            int n = snprintf(b, sizeof b, "[unlink] d=%d\n", d);
+            if (n > 0) { ssize_t r = write(2, b, (size_t)n); (void)r; }
+        }
+    }
     int (*fu)(int, const char*, int) = IEC_REAL(r_unlinkat, unlinkat);
     if (!fu) { errno = ENOSYS; return -1; }
 
