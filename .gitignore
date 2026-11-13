@@ -56,6 +56,7 @@ vgcore.*
 /thirdparty/openssl-*/
 /thirdparty/curl-*/
 /thirdparty/node-*/
+/thirdparty/bash-*/
 /thirdparty/ncurses/
 /thirdparty/libffi/
 /thirdparty/Python-*/
