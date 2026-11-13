@@ -17,14 +17,18 @@
 // loading and the call happen in the forked child, in SpawnSo() below.
 #include "exec_so.h"
 
+#include "../loader/loader.h"
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #define IEC_SO_MAGIC "#IECSOv2"
 
@@ -119,6 +123,27 @@ bool ResolveSoLauncher(const std::string& path, SoLauncher& out, std::string* er
 constexpr int kSoLoadFailedExit = 125;
 constexpr int kSoEntryMissingExit = 126;
 
+// Whether to arm the crash-forensics handlers (elfloader's fault handler, see
+// arm_fault_handlers) in this child. Same switch the old procmgr's kSoMain
+// took from the environment. Checked in two places on purpose: getenv only
+// works for variables the server itself carries, while the request env is
+// what the caller actually sent -- "BSH_FAULT_TRACE=1 bash ..." puts it there.
+// "=0" counts as off, so the switch can be turned off temporarily without an
+// unset. A crashing command so normally reports nothing but rc=139; with the
+// handlers armed the child prints "[elf] fault: SIG… pc=… addr=…" and exits
+// 128+sig. Off by default: the handlers insert themselves into other people's
+// signal chains (node/V8 install their own), and there is no reason to
+// compete for them in normal operation.
+static bool FaultTraceWanted(const SpawnRequest& req) {
+    const char* own = getenv("BSH_FAULT_TRACE");
+    if (own && own[0] && own[0] != '0') return true;
+    for (const auto& kv : req.env) {
+        if (kv.rfind("BSH_FAULT_TRACE=", 0) == 0 && kv.size() > 16 && kv[16] != '0')
+            return true;
+    }
+    return false;
+}
+
 pid_t SpawnSo(const SpawnRequest& req) {
     std::vector<char*> argv;
     std::vector<char*> envp;
@@ -158,6 +183,8 @@ pid_t SpawnSo(const SpawnRequest& req) {
     }
 
     // Loaded here, in the child, so that nothing the object does becomes the server's.
+    if (FaultTraceWanted(req)) elf_arm_fault_handlers();
+
     void* h = dlopen(launcher.so.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (!h) {
         const char* why = dlerror();

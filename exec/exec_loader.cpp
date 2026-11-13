@@ -23,8 +23,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <string>
+#include <vector>
 
 #include <string>
 #include <vector>
@@ -246,7 +250,85 @@ bool ReadInterpImage(const std::string& interp, std::vector<unsigned char>* out)
 
 }  // namespace
 
+// Give up the anonymous mappings below 512 MB before the image is placed.
+//
+// A non-PIE guest carries a fixed load address -- 0x400000 is the classic one
+// -- and the loader reserves that range with MAP_FIXED_NOREPLACE. The forked
+// child starts as a copy of the app process, whose low memory is occupied by
+// one unnamed ~512 MB rw-p region (the ArkTS heap reservation,
+// 0x140000-0x20040000) that covers exactly the addresses such a guest wants
+// (measured with the Bun-compiled kimi binary: "reserve fixed image range
+// [0x400000,+…) failed: File exists"). Unnamed regions count too -- only
+// matching "[anon:" skipped that one, which is what the old procmgr got
+// wrong before fixing it.
+//
+// The ceiling is 512 MB, NOT the 4 GB the old procmgr swept: everything this
+// child still needs -- the anonymous BSS tails behind every library's data
+// mapping (libiec_server's own globals among them: the sweep's first casualty
+// was a silent SIGSEGV on the very first global write), malloc arenas, thread
+// stacks -- lives above that line in this layout, so a 4 GB sweep disarms the
+// process before the guest is even entered. The ArkTS reservation is the one
+// region that actually blocks a non-PIE image; everything else can stay.
+//
+// This is safe here and only here: the child is disposable, and the sweep
+// drops anonymous regions alone. File-backed mappings (host libc, libentry,
+// arkweb's databases) stay -- this child keeps running on them, and dropping
+// them would take the loader down with the guest.
+//
+// Order matters: run this before anything in the child allocates. Fresh
+// mmaps land at the top of the address space in practice, but the whole
+// point of the sweep is that low addresses are then free for the guest, and
+// an allocation parked there first would be munmapped from under us.
+static void UnmapLowAnonRegions() {
+    const unsigned long cap = 0x20000000UL;   /* 512 MB, page-aligned */
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo = 0, hi = 0;
+        char perms[8] = {0};
+        char path[256] = {0};
+        const int n = sscanf(line, "%lx-%lx %7s %*s %*s %*s %255s", &lo, &hi, perms, path);
+        if (n < 3 || hi <= lo) continue;
+        /* Clip, don't skip: the ArkTS reservation ends at 0x20040000, just
+         * past the cap. Dropping regions whose END exceeds the cap would
+         * leave exactly the one region this sweep exists for mapped. */
+        if (lo >= cap) continue;
+        if (hi > cap) hi = cap;
+        if (n < 4 || strncmp(path, "[anon:", 6) == 0)
+            munmap((void*)lo, hi - lo);
+    }
+    fclose(f);
+    /* Do NOT be tempted to also drop the high host-runtime regions:
+     * [anon:native_heap:jemalloc] is NOT a foreign heap -- OHOS musl's native
+     * allocator IS jemalloc, and those regions are the live malloc heap of
+     * this very child (SpawnLoader's vectors, the image slurp, everything).
+     * Sweeping them crashes the loader inside ld-musl's allocation path
+     * (measured: pc in /system/lib/ld-musl-aarch64.so.1, rc=139, 8/8 runs).
+     * The kimi startup flake that motivated the attempt (faulting memset
+     * destination = a musl-heap region end scaled by 16, three samples, all
+     * pre-Bun-sigaction) remains unsolved; compat/sigchain.c carries the
+     * forensics that will name it. */
+}
+
 pid_t SpawnLoader(const SpawnRequest& req) {
+    /* Forensics first: any crash from here on -- in the sweep, the slurp, the
+     * image mapping, or the guest itself -- must be visible. A guest runtime
+     * that installs its own SIGSEGV handler later replaces this one (the
+     * preload shim's sigchain interposition re-chains in that case, see
+     * compat/sigchain.c). */
+    {
+        const char* ft = getenv("BSH_FAULT_TRACE");
+        bool want = ft && ft[0] && ft[0] != '0';
+        for (const std::string& kv : req.env) {
+            if (kv.rfind("BSH_FAULT_TRACE=", 0) == 0 && kv.size() > 16 && kv[16] != '0')
+                want = true;
+        }
+        if (want) elf_arm_fault_handlers();
+    }
+
+    UnmapLowAnonRegions();
+
     if (!req.cwd.empty() && chdir(req.cwd.c_str()) != 0) {
         static const char msg[] = "[exec] chdir failed, started in default path\n";
         if (write(STDERR_FILENO, msg, sizeof msg - 1)) {}

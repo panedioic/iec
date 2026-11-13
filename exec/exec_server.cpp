@@ -3,8 +3,10 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -355,6 +357,62 @@ void ApplyRequestEnvironment(const SpawnRequest& req) {
     }
 }
 
+// ── Run the launch on a fresh, large stack ─────────────────────────────────
+//
+// The child forked above inherits the stack of whichever server thread called
+// fork() -- an event-loop thread, i.e. a pthread with the ~1 MB OHOS default.
+// A real execve() would have discarded that and grown a fresh stack from
+// RLIMIT_STACK (8 MB), but the in-process routes (kSo's dlopen + entry call,
+// kLoader's image mapping) keep running on the inherited one. Guests hit the
+// ceiling quickly: measured with bash 5.2, whose wide-character extmatch
+// recursion exhausts what is left of a 1 MB stack partway through server
+// startup -- every `bash -c <any command>` died with SIGSEGV, pc in
+// libbash.so's extmatch_wc, fault address on an [anon:guard:*] page, while
+// `bash --version` (no command execution) survived.
+//
+// The fix is to run StartByKind from a thread created in the child with an
+// explicit large stack. Virtual memory only: the pages are touched on demand,
+// so 16 MB costs nothing physical. pthread_create after fork is safe enough
+// here -- musl builds the thread stack with mmap and its own TLS machinery,
+// not with locks another (now vanished) thread could have held at fork time.
+// Should pthread_create ever fail, fall back to the old direct call: guests
+// that fit keep working exactly as before.
+//
+// Every StartByKind path leaves through _exit() or execve(), so this thread
+// never returns normally and the parent thread simply parks below it.
+namespace {
+
+constexpr size_t kChildStackSize = 16 * 1024 * 1024;
+
+struct LaunchArgs {
+    LaunchKind kind;
+    const SpawnRequest* req;
+};
+
+void* LaunchOnBigStack(void* arg) {
+    LaunchArgs* la = static_cast<LaunchArgs*>(arg);
+    StartByKind(la->kind, *la->req);
+    _exit(kExecFailedExit);   // not reached: StartByKind never returns
+}
+
+}  // namespace
+
+[[noreturn]] void StartByKindOnBigStack(LaunchKind kind, const SpawnRequest& req) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) StartByKind(kind, req);
+    if (pthread_attr_setstacksize(&attr, kChildStackSize) != 0) {
+        pthread_attr_destroy(&attr);
+        StartByKind(kind, req);
+    }
+    LaunchArgs args{kind, &req};
+    pthread_t tid;
+    const int rc = pthread_create(&tid, &attr, LaunchOnBigStack, &args);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) StartByKind(kind, req);
+    pthread_join(tid, nullptr);   // LaunchOnBigStack leaves through _exit()
+    _exit(kExecFailedExit);       // not reached, kept for symmetry
+}
+
 [[noreturn]] void StartByKind(LaunchKind kind, const SpawnRequest& req) {
     switch (kind) {
         case LaunchKind::kExec:
@@ -450,7 +508,7 @@ static pid_t StartChild(SpawnRequest* req, LaunchKind kind) {
             _exit(kExecFailedExit);
         }
         ApplyRequestEnvironment(*req);
-        StartByKind(kind, *req);
+        StartByKindOnBigStack(kind, *req);
     }
 
     if (requested == PrimaryLaunchKind::kInProc) {

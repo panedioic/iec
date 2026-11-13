@@ -106,6 +106,112 @@ static void fault_handler(int sig, siginfo_t *si, void *uctx)
     raw_write_str(" addr=");
     raw_write_hex(fault);
     raw_write_str("\n");
+#if defined(__aarch64__)
+    /* General register dump. The interesting ones are x30/lr -- the return
+     * address names the actual caller of whatever faulted, which symbol
+     * attribution of pc alone cannot -- and the pointer a faulting load reads
+     * through. sp decides whether the stack pointer itself is sane. */
+    static const char digits[] = "0123456789";
+    char tag[8];
+    for (int i = 0; i < 31; i++) {
+        int t = 0;
+        tag[t++] = ' ';
+        if (i == 30) {
+            tag[t++] = 'l';
+            tag[t++] = 'r';
+        } else {
+            tag[t++] = 'x';
+            if (i < 10) tag[t++] = digits[i];
+            else {
+                tag[t++] = digits[i / 10];
+                tag[t++] = digits[i % 10];
+            }
+        }
+        tag[t++] = '=';
+        (void)write(2, tag, (size_t)t);
+        raw_write_hex(uc->uc_mcontext.regs[i]);
+    }
+    raw_write_str(" sp=");
+    raw_write_hex(uc->uc_mcontext.sp);
+    raw_write_str("\n");
+    /* Walk the frame-pointer chain. When a wild indirect jump lands in random
+     * code, pc and lr describe the landing site, not the callers -- but the
+     * frames below are whatever the caller chain really was. Bounded and
+     * validity-checked; a smashed chain simply terminates the walk early. */
+    {
+        unsigned long fp = uc->uc_mcontext.regs[29];
+        for (int i = 0; i < 24 && fp; i++) {
+            unsigned long* f = (unsigned long*)fp;
+            unsigned long next = f[0];
+            unsigned long ret = f[1];
+            if (next <= fp || next - fp > 0x100000) break;
+            raw_write_str(i == 0 ? "[elf] fp-chain:" : " <-");
+            raw_write_hex(ret);
+            fp = next;
+        }
+        raw_write_str("\n");
+    }
+#endif
+    /* The pc alone is only useful once it names a library, and the crashing
+     * child usually dies before anyone can read its maps. Walk /proc/self/maps
+     * here and echo the lines that hold the pc and the fault address. For a
+     * fault on an [anon:guard:<tid>] page (stack overflow), the interesting
+     * neighbour is the [anon:stack:<tid>] line right after it -- its range
+     * says how much stack the thread actually had -- so the previous line is
+     * kept and replayed when a match asks for context.
+     *
+     * Raw syscalls only: fopen/fgets would take the stdio/malloc locks, and a
+     * crash under a held lock (exactly where a stack overflow often lands)
+     * would hang this handler instead of reporting. */
+    {
+        char buf[4096];
+        int mf = open("/proc/self/maps", O_RDONLY);
+        if (mf >= 0) {
+            ssize_t n;
+            size_t len = 0;
+            char prev[512] = {0};
+            bool prev_matched = false;
+            while ((n = read(mf, buf + len, sizeof buf - len)) > 0) {
+                len += (size_t)n;
+                char* nl = (char*)memchr(buf, '\n', len);
+                while (nl) {
+                    size_t line_len = (size_t)(nl - buf) + 1;
+                    buf[line_len - 1] = '\0';
+                    unsigned long lo = 0, hi = 0;
+                    if (sscanf(buf, "%lx-%lx", &lo, &hi) == 2) {
+                        bool match = (pc >= lo && pc < hi) || (fault >= lo && fault < hi);
+                        if (match) {
+                            (void)write(2, "[elf] map ", 10);
+                            (void)write(2, buf, strlen(buf));
+                            (void)write(2, "\n", 1);
+                        } else if (prev_matched) {
+                            /* prev was a matched [anon:guard:<tid>] page: a
+                             * stack overflow. The line after it names the
+                             * thread's real stack and its size; same tid
+                             * after the tag = same thread. */
+                            const char* g = strstr(prev, "anon:guard:");
+                            const char* s = strstr(buf, "anon:stack:");
+                            if (g && s && strcmp(g + 11, s + 11) == 0) {
+                                (void)write(2, "[elf] map ", 10);
+                                (void)write(2, buf, strlen(buf));
+                                (void)write(2, "\n", 1);
+                            }
+                        }
+                        prev_matched = match;
+                    } else {
+                        prev_matched = false;
+                    }
+                    const size_t keep = line_len < sizeof prev ? line_len : sizeof prev - 1;
+                    memcpy(prev, buf, keep);
+                    prev[keep] = '\0';
+                    memmove(buf, nl + 1, len - line_len);
+                    len -= line_len;
+                    nl = (char*)memchr(buf, '\n', len);
+                }
+            }
+            close(mf);
+        }
+    }
     _exit(128 + sig);
 }
 
@@ -382,6 +488,25 @@ int load_segments(const u8 *img, size_t len, LoadInfo *info)
             error("[elf] reserve %s image range [%#lx,+%#zx) failed: %s",
                   dyn ? "dyn" : "fixed", (unsigned long)(dyn ? 0 : minva),
                   size, strerror(errno));
+            /* Who actually occupies the range? The parent process layout can
+             * drift between boots (ArkTS GC expansion), so dump the child's
+             * own low maps at the moment of failure. Bounded: the low tail of
+             * the maps file is all that matters here. */
+            {
+                FILE* mf = fopen("/proc/self/maps", "r");
+                if (mf) {
+                    char mline[512];
+                    int shown = 0;
+                    while (shown < 12 && fgets(mline, sizeof mline, mf)) {
+                        unsigned long mlo = 0;
+                        if (sscanf(mline, "%lx", &mlo) == 1 && mlo >= 0x40000000UL)
+                            break;
+                        fputs(mline, stderr);
+                        shown++;
+                    }
+                    fclose(mf);
+                }
+            }
             return -1;
         }
     }
