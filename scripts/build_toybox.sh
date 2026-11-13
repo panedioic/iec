@@ -115,6 +115,8 @@ $CC $EXTRA "${SHIM_CFLAGS[@]}" -c "$ROOT/common/sock_client.c" \
 	-o generated/iec_sock_client.o
 $CC $EXTRA "${SHIM_CFLAGS[@]}" -c "$ROOT/compat/exit_wrap.c" \
 	-o generated/exit_wrap.o
+$CC $EXTRA "${SHIM_CFLAGS[@]}" -c "$ROOT/compat/uname_shim.c" \
+	-o generated/iec_uname_shim.o
 
 # main.c has to be compiled separately so the entry can be renamed; toybox
 # dispatches applets from argv[0].
@@ -131,7 +133,7 @@ WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat fstat
        tcgetattr tcsetattr tcgetpgrp tcsetpgrp getpt grantpt unlockpt ptsname
        openpty login_tty forkpty
        execve execv execvp execvpe execl execlp execle
-       exit)
+       uname exit)
 WRAP_FLAGS=()
 for name in "${WRAPS[@]}"; do
 	WRAP_FLAGS+=("-Wl,--wrap=$name")
@@ -149,6 +151,7 @@ $CC $EXTRA -shared -o "$OUT" $OBJS generated/main_custom.o \
 	generated/iec_tty_shim.o generated/iec_fs_shim.o \
 	generated/iec_exec_shim.o generated/iec_rpc.o \
 	generated/iec_sock_client.o generated/exit_wrap.o \
+	generated/iec_uname_shim.o \
 	-Wl,-soname,libtoybox.so "${WRAP_FLAGS[@]}"
 
 "$NM" -D "$OUT" | grep 'bsh_toybox_main$' >/dev/null || {
