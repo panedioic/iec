@@ -44,6 +44,7 @@ SRC=(
 	"$IEC_ROOT/misc/account.c"
 	"$IEC_ROOT/common/rpc.c"
 	"$IEC_ROOT/common/sock_client.c"
+	"$IEC_ROOT/compat/sigchain.c"
 )
 for f in "${SRC[@]}"; do [ -f "$f" ] || { echo "missing source: $f" >&2; exit 1; }; done
 
