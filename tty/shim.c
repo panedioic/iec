@@ -45,6 +45,18 @@
  * this file's own business -- how many descriptors the table above can hold. */
 #define SHIM_MAX_FD   256
 
+/* ioctl's request argument is `unsigned long' in glibc's prototype but `int'
+ * in musl's. INT_PRELOAD builds define the real libc symbol by name and must
+ * match each libc's declaration exactly (INT_WARP builds define __wrap_ioctl
+ * instead -- a symbol of our own, so no prototype conflict there -- but the
+ * __real_ reference below is rewritten to libc's ioctl and must agree with
+ * its declaration). */
+#ifdef __GLIBC__
+#define IEC_IOCTL_REQUEST unsigned long
+#else
+#define IEC_IOCTL_REQUEST int
+#endif
+
 #ifdef INT_WARP
 /* -Wl,--wrap=<name> has the linker provide the original function under
  * __real_<name>, but the compiler still needs a declaration to reference it. */
@@ -54,7 +66,7 @@ extern int __real_dup(int);
 extern int __real_dup2(int, int);
 extern int __real_dup3(int, int, int);
 extern int __real_fcntl(int, int, ...);
-extern int __real_ioctl(int, unsigned long, ...);
+extern int __real_ioctl(int, IEC_IOCTL_REQUEST, ...);
 extern int __real_isatty(int);
 extern int __real_tcgetattr(int, struct termios *);
 extern int __real_tcsetattr(int, int, const struct termios *);
@@ -80,7 +92,7 @@ static int (*real_dup)(int);
 static int (*real_dup2)(int, int);
 static int (*real_dup3)(int, int, int);
 static int (*real_fcntl)(int, int, ...);
-static int (*real_ioctl)(int, unsigned long, ...);
+static int (*real_ioctl)(int, IEC_IOCTL_REQUEST, ...);
 static int (*real_isatty)(int);
 static int (*real_tcgetattr)(int, struct termios *);
 static int (*real_tcsetattr)(int, int, const struct termios *);
@@ -598,7 +610,7 @@ int IEC_EXPORT(tcsetpgrp)(int fd, pid_t pgrp) {
     return pts_tcsetpgrp(n, pgrp);
 }
 
-int IEC_EXPORT(ioctl)(int fd, unsigned long request, ...) {
+int IEC_EXPORT(ioctl)(int fd, IEC_IOCTL_REQUEST request, ...) {
     int n = identify(fd);
     void *arg;
     va_list ap;
