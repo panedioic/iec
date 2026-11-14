@@ -398,13 +398,13 @@ static pid_t send_exec_request(enum CallMethod method, const char *file,
      * target and small enough to sit on the stack of a thread that is not the main
      * one. Overrunning it stays a defined failure: see the too_long arm below,
      * which reports it and fails the call with E2BIG. */
-    enum { EXEC_REQ_MAX = 32768, EXEC_FLAG_WAIT = 1, EXEC_FLAG_STDIO = 2, EXEC_STDIO_FDS = 3,
+    enum { EXEC_REQ_MAX = 32768, EXEC_FLAG_WAIT = 1, EXEC_FLAG_STDIO = 2, EXEC_INHERIT_FDS = 64,
            EXEC_PID_REPLY = 4, EXEC_FAIL_REPLY = 8 };
     uint8_t req[EXEC_REQ_MAX];
     uint8_t answer[EXEC_FAIL_REPLY];      /* the larger of the two OP_EXECUTE answers */
     uint32_t answer_len;
-    int send_fds[EXEC_STDIO_FDS];
-    uint32_t targets[EXEC_STDIO_FDS];
+    int send_fds[EXEC_INHERIT_FDS];
+    uint32_t targets[EXEC_INHERIT_FDS];
     int nfds = 0, fd;
     size_t off, argc = 0, envc = 0, i, len;
     char *const *env;                     /* the environment the request carries */
@@ -458,12 +458,17 @@ static pid_t send_exec_request(enum CallMethod method, const char *file,
     for (i = 0; i < (size_t)KEPT_COUNT; i++) kept_n += (kept >> i) & 1u;
     if (drop_tty_pts) envc--;              /* keep the header count in step with what gets written */
 
-    /* The child is started on the server, so our own stdio -- the terminal this
-     * exec was called from -- has to travel with the request; without it the
-     * child writes to whatever the server was started with. A closed fd is
-     * skipped, which is what the target list is for. */
-    for (fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
-        if (fcntl(fd, F_GETFD) < 0) continue;
+    /* The child is started on the server, so every fd the real execve would
+     * let it inherit has to travel with the request. That is not just stdio:
+     * a real execve keeps every descriptor whose close-on-exec flag is clear,
+     * at the same numbers -- and spawners lean on it. code-server spawns its
+     * server child with a libuv IPC pipe on fd 3 and handshakes over that
+     * channel; with only 0-2 forwarded the child never answers and the parent
+     * dies with "timed out" (measured). Scan 0..fd-cap and forward the
+     * non-CLOEXEC ones, skipping closed fds -- exactly the kernel's rule. */
+    for (fd = 0; fd < EXEC_INHERIT_FDS; fd++) {
+        int flags = fcntl(fd, F_GETFD);
+        if (flags < 0 || (flags & FD_CLOEXEC)) continue;
         send_fds[nfds] = fd;
         targets[nfds] = (uint32_t)fd;
         nfds++;

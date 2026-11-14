@@ -10,8 +10,10 @@
 #define SOCK_VERSION   1
 #define SOCK_OP_ERROR  0xFFFFFFFFu
 
-/* Maximum fds a single reply may carry. */
-#define SOCK_MAX_FDS   8
+/* Maximum fds a single packet may carry, either way: the request an exec
+ * shim sends (kernel-execve semantics keep every non-CLOEXEC fd alive -- 25 is
+ * a realistic count for a forked child of the app) and a reply may carry. */
+#define SOCK_MAX_FDS   64
 
 typedef struct {
     int      fd;

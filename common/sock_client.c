@@ -107,7 +107,13 @@ int sock_connect(sock_client *c, const char *path) {
     strcpy(addr.sun_path, path);
 
     c->version = SOCK_VERSION;
-    c->fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    /* SOCK_CLOEXEC: this connection is the process's private RPC channel to
+     * the services. exec/shim.c forwards every non-CLOEXEC fd across an exec
+     * (kernel execve semantics -- code-server's IPC pipe on fd 3 is why), so
+     * a CLOEXEC-less socket here would leak the parent's service connection
+     * into every guest child. libuv and friends set CLOEXEC on their own fds
+     * before exec; ours must play by the same rule. */
+    c->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (c->fd < 0) return -1;
     if (connect(c->fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         close(c->fd);

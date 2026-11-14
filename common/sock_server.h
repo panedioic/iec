@@ -30,8 +30,10 @@ constexpr uint32_t kHeaderLen = 16;
 constexpr uint16_t kVersion = 1;
 constexpr uint32_t kMaxPacketLen = 1u << 20;
 constexpr uint32_t kOpError = 0xFFFFFFFF;
-// Caps both the SCM_RIGHTS payload of one message and Reply::fds.
-constexpr int kMaxFds = 8;
+// Caps both the SCM_RIGHTS payload of one message and Reply::fds. Sized to
+// match SOCK_MAX_FDS on the client: an exec request carries every fd a real
+// execve would let the child inherit (25+ for a forked child of the app).
+constexpr int kMaxFds = 64;
 
 struct Packet {
     uint32_t length = 0;      // Total length

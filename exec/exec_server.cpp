@@ -743,13 +743,16 @@ bool ExecServer::onExecute(const Packet& req, Reply& reply) {
     off = 20 + (size_t)fd_count * 4;
     for (uint32_t i = 0; i < fd_count; i++) {
         uint32_t target = get32(b + 20 + (size_t)i * 4);
-        // Only the three standard descriptors are inherited for now. A target
-        // beyond them would need a launch path that does not exist yet, and
-        // taking the entry while ignoring it would silently drop what the caller
-        // asked for, so an unknown target is an invalid request.
-        if (target > STDERR_FILENO) {
+        // Any fd number a real execve would keep is a legitimate target: the
+        // shim forwards everything non-CLOEXEC (kernel semantics), and spawners
+        // put real channels above stdio -- libuv's IPC pipe for a spawned child
+        // lands on fd 3, which code-server's stdio handshake depends on. The
+        // cap matches the shim's forwarding window (EXEC_INHERIT_FDS) and the
+        // packet's SCM_RIGHTS budget (kMaxFds). InstallInheritedFds dup2s to
+        // the target numbers, so nothing here is stdio-specific.
+        if (target >= 64) {
             Logger::GetInstance()->LogE(
-                "[exec] fd target %u is not a standard descriptor", target);
+                "[exec] fd target %u is beyond the inherit window", target);
             return false;
         }
         sr.stdio_fds.push_back(InheritedFd{req.fds[i], static_cast<int>(target)});
