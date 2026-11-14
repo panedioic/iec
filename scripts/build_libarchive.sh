@@ -158,6 +158,15 @@ if [ "$SHARED" = "1" ]; then
 
 	iec_log "shared object: $HAR_LIBS/libarchive.so"
 	"$READELF" -d "$HAR_LIBS/libarchive.so" | grep -E 'NEEDED|SONAME' >&2 || true
+	# A shim-baked library must be self-contained: an undefined __wrap_/
+	# __real_ here resolves only against the host process's global scope at
+	# dlopen time, and whatever satisfies it today can vanish with the next
+	# app build (measured: __wrap_posix_spawnp rode along from a stale wrap
+	# list, went unsatisfied, and every bootstrap tar unpack failed with
+	# "cannot dlopen libarchive"). Fail the build instead.
+	if "$NM" -D -u "$HAR_LIBS/libarchive.so" | grep -E '__wrap_|__real_' >/dev/null; then
+		iec_err "libarchive.so has unresolved __wrap_/__real_ symbols (wrap list vs shim objects mismatch)"
+	fi
 	"$NM" -D --defined-only "$HAR_LIBS/libarchive.so" \
 		| grep -E ' (T|W) archive_read_new$' >/dev/null \
 		|| iec_err "archive_read_new is not exported"
