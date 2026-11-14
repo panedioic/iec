@@ -130,7 +130,7 @@ make -C "$BUILD" install > "$BUILD/install.log" 2>&1 \
 FS_WRAPS=(symlink symlinkat readlink readlinkat lstat stat fstatat fstat
           chmod fchmod fchmodat
           open openat unlink unlinkat rename renameat access faccessat realpath
-          link linkat opendir readdir scandir fopen freopen utimensat futimens posix_spawn posix_spawnp syscall)
+          link linkat opendir readdir scandir fopen freopen utimensat futimens syscall)
 FS_WRAP_FLAGS=()
 for name in "${FS_WRAPS[@]}"; do
 	FS_WRAP_FLAGS+=("-Wl,--wrap=$name")
@@ -151,7 +151,7 @@ if [ "$SHARED" = "1" ]; then
 	$CC_TARGET -shared -o "$SO13" \
 		-Wl,--whole-archive "$LIB" -Wl,--no-whole-archive \
 		"$FS_SO_OBJ" "$IEC_DEPS_LIB/libz.a" \
-		-Wl,-soname,libarchive.so.13 -Wl,-Bsymbolic-functions \
+		-Wl,-soname,libarchive.so.13 -Wl,-Bsymbolic-functions -Wl,--no-undefined \
 		"${FS_WRAP_FLAGS[@]}" -lpthread -lm \
 		|| iec_err "libarchive.so link failed"
 	ln -sf "libarchive.so.13" "$HAR_LIBS/libarchive.so"
