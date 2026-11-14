@@ -216,14 +216,29 @@ void EnsureGlibcTunable(std::vector<std::string>* env) {
 // and installs the downgrade again), and its syscall wrapper answers the
 // io_uring_setup probe with ENOSYS before a signal is ever raised. This is the
 // IEC counterpart of procmgr's ChildRunElf shim selection.
+//
+// The shim is libc-specific, so the pick is by the guest's interpreter, exactly
+// the split ChildRunElf made: ld-linux -> libiec_preload.so (glibc ABI),
+// ld-musl -> libiec_preload_musl.so (OHOS-musl ABI -- the musl guest actually
+// runs on the bundle's ld-musl, see ReadInterpImage, and without its shim its
+// execve lands on the kernel and dies: the musl testprogs lost exec self/
+// sibling/dependent AND the fs/pty emulations to this, 6 of 31 checks). An
+// empty interpreter (static guest) gets nothing -- a -static binary has no
+// dynamic loader, so LD_PRELOAD cannot reach it.
 void EnsureGuestShim(const std::string& interp, std::vector<std::string>* env) {
-    if (interp.find("ld-musl") != std::string::npos) return;   // musl guest: no shim shipped
+    const char* shim;
+    if (interp.empty()) return;   // static guest: nothing can preload it
+    if (interp.find("ld-musl") != std::string::npos) {
+        shim = "libiec_preload_musl.so";
+    } else {
+        shim = "libiec_preload.so";
+    }
 
-    const std::string shim = std::string(IEC_BUNDLE_LIBS) + "libiec_preload.so";
+    const std::string path = std::string(IEC_BUNDLE_LIBS) + shim;
     struct stat st;
-    if (stat(shim.c_str(), &st) != 0) return;   // not shipped: stay compatible
+    if (stat(path.c_str(), &st) != 0) return;   // not shipped: stay compatible
 
-    EnvPrepend(env, "LD_PRELOAD", shim);
+    EnvPrepend(env, "LD_PRELOAD", path);
 }
 
 // Try the literal PT_INTERP path first (host builds and real /lib), then the
