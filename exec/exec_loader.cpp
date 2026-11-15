@@ -15,6 +15,7 @@
 
 #include "../common/constant.h"
 #include "../loader/loader.h"
+#include "caps.h"
 #include "logger/logger.h"
 
 #include <elf.h>
@@ -24,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -353,6 +355,9 @@ pid_t SpawnLoader(const SpawnRequest& req) {
      * SIGSYS; downgrading them to -ENOSYS is the whole guest survival story of
      * the old procmgr. Install before entering any image. */
     InstallSigSysDowngrade();
+    
+    // if (Caps().jit != 0)
+    //     prctl(0x6a6974L /* 'jit' */, 0, 1, 0, 0);
 
     std::vector<char*> argv;
     argv.reserve(req.argv.size() + 1);
