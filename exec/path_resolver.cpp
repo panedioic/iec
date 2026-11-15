@@ -118,6 +118,25 @@ std::string ResolveSimulated(const std::string& path, const std::string& cwd) {
     return rc == 0 ? std::string(out) : path;
 }
 
+// The deb wrapper scripts apt installs (usr/bin/java is a three-line sh:
+//     exec /usr/lib/jvm/java-21-openjdk-arm64/bin/java "$@")
+// exec absolute FHS paths that do not exist on the real root (/usr lives only
+// under the fake root). The guest fs shim's kPathMap catch-all maps stat/open
+// of those paths, so the shell happily fires the execve -- but the request
+// still carries the raw path, which stat() here cannot resolve. UnderFakeRoot
+// only rewrites the bin prefixes (kSysBins); this fallback covers the rest
+// (/usr/lib, /usr/share, /etc, ...): when the raw path is not executable,
+// retry it once under the fake root. On a miss the fake-root path is returned
+// so the caller still reports ENOENT -- candidate-walking callers (CPython's
+// child_exec) skip to the next candidate on ENOENT and must keep that signal.
+std::string WithFakeRootFallback(const std::string& resolved, const std::string& path,
+                                 const std::string& cwd) {
+    if (Caps().path != 0) return resolved;
+    if (path.empty() || path[0] != '/' || resolved != path) return resolved;
+    if (access(path.c_str(), X_OK) == 0) return resolved;
+    return ResolveSimulated(std::string(FAKE_SYSROOT) + path, cwd);
+}
+
 }  // namespace
 
 std::string UnderFakeRoot(const std::string& path) {
@@ -135,7 +154,10 @@ std::string ResolveRelativePath(const std::string& path, const std::string& cwd)
     /* Absolute paths can still be simulated symlinks (clang -> clang-15 in an
      * extracted toolchain). Resolve them here instead of relying on the caller's
      * fs shim: the exec service's own stat/open cannot see .IEC_SYMLINK. */
-    if (path[0] == '/') return ResolveSimulated(path, cwd);
+    if (path[0] == '/') {
+        const std::string resolved = ResolveSimulated(path, cwd);
+        return WithFakeRootFallback(resolved, path, cwd);
+    }
 
     /* A bare name is a PATH search; only explicit paths are cwd-relative. */
     if (path.find('/') == std::string::npos) return path;
@@ -153,7 +175,10 @@ std::string ResolveFilePath(const std::string& path, const std::vector<std::stri
          * that only exists under the fake root — the caller may have resolved
          * PATH itself (posix_spawn callers like CPython do), so apply the
          * mapping here too; UnderFakeRoot leaves other paths unchanged. */
-        if (path[0] == '/') return UnderFakeRoot(path);
+        if (path[0] == '/') {
+            const std::string resolved = UnderFakeRoot(path);
+            return WithFakeRootFallback(resolved, path, cwd);
+        }
         return ResolveRelativePath(path, cwd);
     }
 
