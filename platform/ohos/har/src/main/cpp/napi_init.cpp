@@ -863,147 +863,52 @@ napi_value CopyRawFile(napi_env env, napi_callback_info info) {
     return IntResult(env, 0);
 }
 
-// Copies every top-level file under rawfile "programs" into <fake root>/usr/bin,
-// dropping a ".sh" suffix and marking the result executable (code.sh -> code).
-// Directories are skipped (only the flat launcher scripts belong there).
-//
-// Some launchers are one script serving many command names: llvm.sh dispatches
-// on $0 to the same-named tool inside the user's commandline-tools SDK. Those
-// are listed in kAliases and installed once per name.
-// Returns the number of files that could not be installed; 0 means all in place.
-napi_value InstallPrograms(napi_env env, napi_callback_info /*info*/) {
+// Writes ONE program launcher: copies rawfile "programs/<raw>" to
+// <fake root>/usr/bin/<target> and marks it executable. The name table lives
+// on the caller side (EntryAbility's writeAllProgramLaunchers) and drives one
+// call per command name the user types -- the same shape as WriteSoLauncher,
+// so adding a launcher is an ArkTS diff and there is no native alias table to
+// keep in sync with shell.cpp's kRenames.
+// Returns 0 on success, 1 on failure (bad args, missing rawfile, write error).
+napi_value WriteProgramLauncher(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    std::string raw, target;
+    if (argc < 2 ||
+        !ReadStringArg(env, argv[0],
+                       "writeProgramLauncher(raw, target) expects two strings", raw) ||
+        !ReadStringArg(env, argv[1],
+                       "writeProgramLauncher(raw, target) expects two strings", target))
+        return nullptr;
+
     if (!g_res_mgr) {
-        Logger::GetInstance()->LogE("[iec] installPrograms: resource manager is not set");
+        Logger::GetInstance()->LogE("[iec] writeProgramLauncher: resource manager is not set");
         return IntResult(env, 1);
     }
-
-    // raw name -> the extra command names the script answers to. Keep in sync
-    // with the kRenames table in feature/bsh_main's shell.cpp (legacy path).
-    static const std::pair<const char*, const char*> kAliases[] = {
-        {"llvm.sh", "clang"},
-        {"llvm.sh", "clang++"},
-        {"llvm.sh", "clang-15"},
-        {"llvm.sh", "clang-cpp"},
-        {"llvm.sh", "clangd"},
-        {"llvm.sh", "ld.lld"},
-        {"llvm.sh", "lld"},
-        {"llvm.sh", "llvm-ar"},
-        {"llvm.sh", "llvm-nm"},
-        {"llvm.sh", "llvm-objcopy"},
-        {"llvm.sh", "llvm-objdump"},
-        {"llvm.sh", "llvm-ranlib"},
-        {"llvm.sh", "llvm-readelf"},
-        {"llvm.sh", "llvm-readobj"},
-        {"llvm.sh", "llvm-size"},
-        {"llvm.sh", "llvm-strip"},
-        {"llvm.sh", "llvm-strings"},
-        {"llvm.sh", "llvm-symbolizer"},
-        {"llvm.sh", "llvm-cov"},
-        {"llvm.sh", "llvm-profdata"},
-        {"llvm.sh", "llvm-config"},
-        {"llvm.sh", "aarch64-unknown-linux-ohos-clang"},
-        {"llvm.sh", "aarch64-unknown-linux-ohos-clang++"},
-        {"cmake.sh", "cmake"},
-        {"cmake.sh", "ninja"},
-        // jdk.sh：OpenJDK 工具启动器（JVM 由 apt 装，见 programs/jdk.sh 头注释）。
-        // 名单 = JVM bin/ 下的全部工具，装完 openjdk-21 即全部可用。
-        {"jdk.sh", "java"},
-        {"jdk.sh", "javac"},
-        {"jdk.sh", "jar"},
-        {"jdk.sh", "jarsigner"},
-        {"jdk.sh", "javadoc"},
-        {"jdk.sh", "javap"},
-        {"jdk.sh", "jcmd"},
-        {"jdk.sh", "jdb"},
-        {"jdk.sh", "jdeprscan"},
-        {"jdk.sh", "jdeps"},
-        {"jdk.sh", "jfr"},
-        {"jdk.sh", "jhsdb"},
-        {"jdk.sh", "jimage"},
-        {"jdk.sh", "jinfo"},
-        {"jdk.sh", "jlink"},
-        {"jdk.sh", "jmap"},
-        {"jdk.sh", "jmod"},
-        {"jdk.sh", "jpackage"},
-        {"jdk.sh", "jps"},
-        {"jdk.sh", "jrunscript"},
-        {"jdk.sh", "jshell"},
-        {"jdk.sh", "jstack"},
-        {"jdk.sh", "jstat"},
-        {"jdk.sh", "jstatd"},
-        {"jdk.sh", "jwebserver"},
-        {"jdk.sh", "keytool"},
-        {"jdk.sh", "rmiregistry"},
-        {"jdk.sh", "serialver"},
-    };
-
-    RawDir* dir = OH_ResourceManager_OpenRawDir(g_res_mgr, "programs");
-    if (!dir) {
-        Logger::GetInstance()->LogE("[iec] installPrograms: cannot open rawfile programs/");
+    if (raw.empty() || raw.find('/') != std::string::npos ||
+        raw.find('\n') != std::string::npos ||
+        target.empty() || target.find('/') != std::string::npos ||
+        target.find('\n') != std::string::npos) {
+        Logger::GetInstance()->LogE("[iec] invalid program launcher: %s -> %s",
+                                    raw.c_str(), target.c_str());
         return IntResult(env, 1);
     }
 
     const std::string dest_dir = std::string(FAKE_SYSROOT) + "/usr/bin";
-    if (!EnsureDirs(dest_dir)) {
-        OH_ResourceManager_CloseRawDir(dir);
+    if (!EnsureDirs(dest_dir)) return IntResult(env, 1);
+
+    const std::string dst = dest_dir + "/" + target;
+    std::vector<unsigned char> data;
+    if (!ReadRawFile(g_res_mgr, "programs/" + raw, &data) ||
+        !WriteFile(dst, data.data(), data.size(), 0755) ||
+        chmod(dst.c_str(), 0755) != 0) {
+        Logger::GetInstance()->LogW("[iec] writeProgramLauncher %s -> %s failed",
+                                    raw.c_str(), dst.c_str());
         return IntResult(env, 1);
     }
-
-    EnsureDirs(std::string(FAKE_SYSROOT) + "/tmp");
-
-    auto install = [&dest_dir](const std::string& raw, const std::string& name) -> bool {
-        std::vector<unsigned char> data;
-        const std::string dst = dest_dir + "/" + name;
-        if (!ReadRawFile(g_res_mgr, raw, &data) ||
-            !WriteFile(dst, data.data(), data.size(), 0755) ||
-            chmod(dst.c_str(), 0755) != 0) {
-            Logger::GetInstance()->LogW("[iec] installPrograms %s -> %s failed",
-                                        raw.c_str(), dst.c_str());
-            return false;
-        }
-        return true;
-    };
-
-    int failed = 0;
-    int installed = 0;
-    const int count = OH_ResourceManager_GetRawFileCount(dir);
-    for (int i = 0; i < count; ++i) {
-        const char* raw_name = OH_ResourceManager_GetRawFileName(dir, i);
-        if (!raw_name) {
-            ++failed;
-            continue;
-        }
-
-        const std::string name = raw_name;
-        const std::string raw = "programs/" + name;
-        if (OH_ResourceManager_IsRawDir(g_res_mgr, raw.c_str())) continue;
-
-        // Every alias gets its own copy under the name the user types.
-        bool aliased = false;
-        for (const auto& a : kAliases) {
-            if (name != a.first) continue;
-            aliased = true;
-            if (install(raw, a.second)) ++installed;
-            else ++failed;
-        }
-        if (aliased) continue;
-
-        // Install under the name the user types: strip the .sh suffix.
-        std::string target = name;
-        if (target.size() > 3 && target.compare(target.size() - 3, 3, ".sh") == 0)
-            target = target.substr(0, target.size() - 3);
-
-        if (!install(raw, target)) {
-            ++failed;
-            continue;
-        }
-        ++installed;
-    }
-    OH_ResourceManager_CloseRawDir(dir);
-
-    Logger::GetInstance()->LogI(
-        "[iec] installPrograms: %d installed, %d failed", installed, failed);
-    return IntResult(env, failed);
+    return IntResult(env, 0);
 }
 
 napi_value Init(napi_env env, napi_value exports) {
@@ -1041,7 +946,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"unpackResource",              nullptr, UnpackResource,            nullptr, nullptr, nullptr, napi_default, nullptr},
         {"writeTxtFile",                nullptr, WriteTxtFile,              nullptr, nullptr, nullptr, napi_default, nullptr},
         {"copyRawFile",                 nullptr, CopyRawFile,               nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"installPrograms",             nullptr, InstallPrograms,           nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"writeProgramLauncher",        nullptr, WriteProgramLauncher,      nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;

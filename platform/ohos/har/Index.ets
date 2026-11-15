@@ -15,7 +15,7 @@ import {
   unpackResource,
   writeTxtFile,
   copyRawFile,
-  installPrograms
+  writeProgramLauncher,
 } from 'libiec_server.so';
 
 export {
@@ -33,5 +33,5 @@ export {
   unpackResource,
   writeTxtFile,
   copyRawFile,
-  installPrograms
+  writeProgramLauncher,
 };

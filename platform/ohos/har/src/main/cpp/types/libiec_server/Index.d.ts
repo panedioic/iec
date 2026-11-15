@@ -57,7 +57,7 @@ export const writeTxtFile: (target: string, data: string) => number;
 //   0 success, 1 no resource manager, 2 rawfile missing/empty, 3 write failed.
 export const copyRawFile: (rawName: string, dstPath: string) => number;
 
-// Copies every top-level file under rawfile "programs" into <fake root>/usr/bin,
-// strips a ".sh" suffix (code.sh -> code) and marks it executable. Returns the
-// number of files that could not be installed; 0 means all in place.
-export const installPrograms: () => number;
+// Writes ONE program launcher: copies rawfile "programs/<raw>" (e.g. "jdk.sh")
+// to <fake root>/usr/bin/<target> (the name the user types) and marks it
+// executable. Returns 0 on success, 1 on failure.
+export const writeProgramLauncher: (raw: string, target: string) => number;
