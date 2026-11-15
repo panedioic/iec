@@ -903,6 +903,8 @@ napi_value InstallPrograms(napi_env env, napi_callback_info /*info*/) {
         {"llvm.sh", "llvm-config"},
         {"llvm.sh", "aarch64-unknown-linux-ohos-clang"},
         {"llvm.sh", "aarch64-unknown-linux-ohos-clang++"},
+        {"cmake.sh", "cmake"},
+        {"cmake.sh", "ninja"},
     };
 
     RawDir* dir = OH_ResourceManager_OpenRawDir(g_res_mgr, "programs");

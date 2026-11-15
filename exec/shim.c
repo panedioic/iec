@@ -326,7 +326,7 @@ __attribute__((noreturn)) static void become_stand_in(uint32_t remote_pid) {
     _exit(EXEC_STATUS_LOST);
 }
 
-static const char *const g_kept[] = { "LD_PRELOAD", "PATH" };
+static const char *const g_kept[] = { "PATH" };
 #define KEPT_COUNT ((int)(sizeof g_kept / sizeof g_kept[0]))
 
 /* Whether the environment names the variable. The '=' is part of the match, so
@@ -450,13 +450,28 @@ static pid_t send_exec_request(enum CallMethod method, const char *file,
         }
     }
 
+    /* LD_PRELOAD does not cross a spawn boundary. It is spawn infrastructure:
+     * the server re-injects the shim that matches each child's own libc
+     * (EnsureGuestShim, by PT_INTERP), so whatever the caller had loaded would
+     * only survive into the child's environment and make the child's loader
+     * load a shim of the wrong libc ABI. Measured: glibc cmake's
+     * LD_PRELOAD=libiec_preload.so leaked into the musl ninja it spawned and
+     * every relocation on it failed ("Error relocating ...: __isoc23_strtoll:
+     * symbol not found"). Dropped here unconditionally, like IEC_TTY_PTS. */
+    int drop_ld_preload = 0;
+    {
+        size_t k;
+        for (k = 0; k < (size_t)envc; k++) {
+            if (strncmp(env[k], "LD_PRELOAD=", 11) == 0) { drop_ld_preload = 1; break; }
+        }
+    }
+
     /* Which variables that environment has to be given, decided here because the
      * header below carries the count of them; the entries themselves are appended
      * further down. Zero when it already names every entry of g_kept, so an
      * ordinary request goes out exactly as it did before. */
     kept = kept_mask(env);
     for (i = 0; i < (size_t)KEPT_COUNT; i++) kept_n += (kept >> i) & 1u;
-    if (drop_tty_pts) envc--;              /* keep the header count in step with what gets written */
 
     /* The child is started on the server, so every fd the real execve would
      * let it inherit has to travel with the request. That is not just stdio:
@@ -480,7 +495,9 @@ static pid_t send_exec_request(enum CallMethod method, const char *file,
     body_put32(req, EXEC_FLAG_WAIT | (nfds > 0 ? EXEC_FLAG_STDIO : 0u));
     body_put32(req + 4, (uint32_t)method);
     body_put32(req + 8, (uint32_t)argc);
-    body_put32(req + 12, (uint32_t)(envc + kept_n));
+    /* envc still holds the ORIGINAL count here: the dropped entries are skipped
+     * in place by the writer below, so the header count subtracts them here. */
+    body_put32(req + 12, (uint32_t)(envc - drop_tty_pts - drop_ld_preload + kept_n));
     body_put32(req + 16, (uint32_t)nfds);
     for (i = 0; i < (size_t)nfds; i++) body_put32(req + 20 + 4 * i, targets[i]);
 
@@ -508,20 +525,18 @@ static pid_t send_exec_request(enum CallMethod method, const char *file,
     PUT_CSTR(file);
     PUT_CSTR(cwd);                         /* empty means inherit; see above */
     for (i = 0; i < argc; i++) PUT_CSTR(argv[i]);
-    if (drop_tty_pts) {
-        /* Upper bound must be the ORIGINAL entry count: envc was decremented
-         * before the header, and iterating to it would drop the last env entry,
-         * leaving the body shorter than the header declares -- the server then
-         * fails with "string is not terminated" (measured). */
+    {
+        /* envc is the ORIGINAL entry count (drops are skipped in place below,
+         * never by shrinking the loop): iterating past it would walk into the
+         * NULL terminator -- strlen(NULL) segfaults (measured). */
         size_t written = 0;
-        for (i = 0; i < envc + 1; i++) {
-            if (strncmp(env[i], "IEC_TTY_PTS=", 12) == 0) continue;
+        for (i = 0; i < (size_t)envc; i++) {
+            if (drop_tty_pts && strncmp(env[i], "IEC_TTY_PTS=", 12) == 0) continue;
+            if (drop_ld_preload && strncmp(env[i], "LD_PRELOAD=", 11) == 0) continue;
             PUT_CSTR(env[i]);
             written++;
         }
-        envc = written;                    /* in step with the actual writes (header already counted -1) */
-    } else {
-        for (i = 0; i < envc; i++) PUT_CSTR(env[i]);
+        envc = written;                    /* in step with the actual writes */
     }
     /* Last, so the caller's own order is what the program reads first. The mask is
      * what says which of them; getenv() cannot answer NULL for one it names, since
